@@ -30,10 +30,6 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
 
-/**
- * 主界面：内嵌一个 WebView，指向本机 Node 服务器（127.0.0.1:3000）。
- * 优化：引入原生 Loading 页面 + 后台线程解压，解决首次冷启动黑屏问题。
- */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
@@ -41,7 +37,6 @@ class MainActivity : AppCompatActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val io = Executors.newSingleThreadExecutor()
 
-    // 🌟 原生加载过渡层
     private lateinit var rootLayout: FrameLayout
     private lateinit var nativeLoadingView: TextView
 
@@ -49,6 +44,10 @@ class MainActivity : AppCompatActivity() {
     private var serverName: String? = null
     private val hookedUrls = java.util.Collections.synchronizedSet(mutableSetOf<String>())
     private var hookCheckDone = false
+
+    // 🌟 双重加载与时间控制
+    private var isFirstLoad = true
+    private var loadingStartTime = 0L
 
     companion object {
         private const val TAG = "StrongholdShell"
@@ -72,38 +71,38 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 0) 读取参数
         serverAddress = intent.getStringExtra(EXTRA_SERVER_ADDRESS)?.takeIf { it.isNotBlank() }
         serverName = intent.getStringExtra(EXTRA_SERVER_NAME)
-        Log.i(TAG, "启动模式: " + if (serverAddress == null) "单机" else "联机 -> $serverAddress")
 
-        // 1) 优先初始化 UI（确保秒出画面，告别黑屏）
+        // 1) 初始化 UI 层级：WebView 在底层，原生白字在最上层遮挡
         webView = WebView(this)
         webView.setBackgroundColor(Color.BLACK)
+        webView.visibility = View.VISIBLE // 底层可见，但被上层盖住
         
         rootLayout = FrameLayout(this)
         nativeLoadingView = TextView(this).apply {
-            text = "正在准备游戏资源，首次启动可能较慢..."
+            text = "正在准备游戏资源，请稍候..."
             setTextColor(Color.WHITE)
             textSize = 16f
             gravity = android.view.Gravity.CENTER
+            setBackgroundColor(Color.parseColor("#0d1117"))
+            visibility = View.VISIBLE
         }
         
-        rootLayout.addView(nativeLoadingView, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-        rootLayout.addView(webView, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        // 记录白字出现的时间（用于防闪烁）
+        loadingStartTime = System.currentTimeMillis()
         
-        webView.visibility = View.INVISIBLE
-        nativeLoadingView.visibility = View.VISIBLE
+        rootLayout.addView(webView, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        rootLayout.addView(nativeLoadingView, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         
         setContentView(rootLayout)
 
-        // 2) 初始化 WebView 相关配置
         setupWebView()
         setupImmersiveMode()
         installBridgeIfNeeded()
         registerReceiverCompat()
 
-        // 3) 🌟 将重活（解压、初始化）放到后台线程，防止阻塞主线程导致黑屏
+        // 2) 后台执行重活，防止主线程卡顿黑屏
         io.execute {
             try {
                 if (!GamePack.hasActivePack(this)) {
@@ -114,13 +113,9 @@ class MainActivity : AppCompatActivity() {
                 Log.e(TAG, "后台初始化失败", e)
             }
 
-            // 4) 回到主线程启动服务
             mainHandler.post {
                 if (isFinishing || isDestroyed) return@post
-                
-                // 更新提示文字
                 nativeLoadingView.text = "正在启动游戏引擎..."
-                
                 startNodeService()
                 pollHealthAndLoad()
 
@@ -169,10 +164,34 @@ class MainActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 
-                // 🌟 页面加载完了，WebView 登场，原生文字退场
-                if (!isFinishing && !isDestroyed) {
-                    webView.visibility = View.VISIBLE
-                    nativeLoadingView.visibility = View.GONE
+                if (url?.startsWith(LOCAL_URL) == true) {
+                    if (isFirstLoad) {
+                        // 🌟 第一次加载完成（预热缓存），延迟 300ms 触发第二次加载
+                        isFirstLoad = false
+                        if (!isFinishing && !isDestroyed) {
+                            nativeLoadingView.text = "正在渲染游戏画面..."
+                        }
+                        mainHandler.postDelayed({
+                            if (!isFinishing && !isDestroyed) {
+                                val suffix = if (serverAddress != null) "?multiplayer=1" else ""
+                                webView.loadUrl("$LOCAL_URL/index.html$suffix")
+                            }
+                        }, 300)
+                    } else {
+                        // 🌟 第二次加载完成，计算时间以决定何时撤下白字
+                        if (!isFinishing && !isDestroyed) {
+                            val elapsedTime = System.currentTimeMillis() - loadingStartTime
+                            // 最小显示时间 500ms，防止白字一闪而过
+                            val minDisplayTime = 500L 
+                            val delayTime = if (elapsedTime < minDisplayTime) minDisplayTime - elapsedTime else 0L
+                            
+                            mainHandler.postDelayed({
+                                if (!isFinishing && !isDestroyed) {
+                                    nativeLoadingView.visibility = View.GONE
+                                }
+                            }, delayTime)
+                        }
+                    }
                 }
 
                 if (serverAddress != null) {
@@ -184,21 +203,7 @@ class MainActivity : AppCompatActivity() {
         webView.webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(msg: android.webkit.ConsoleMessage?): Boolean {
                 val m = msg ?: return true
-                val line = "[${m.messageLevel()}] ${m.message()} (${m.sourceId()}:${m.lineNumber()})"
-                Log.i(TAG, "CONSOLE $line")
-                if (serverAddress != null &&
-                    (m.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.ERROR ||
-                     m.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.WARNING)
-                ) {
-                    val text = m.message()
-                    if (text.contains("net", ignoreCase = true) ||
-                        text.contains("ws", ignoreCase = true) ||
-                        text.contains("socket", ignoreCase = true) ||
-                        text.contains("connect", ignoreCase = true)
-                    ) {
-                        mainHandler.post { showToastLike("JS: " + text.take(120)) }
-                    }
-                }
+                Log.i(TAG, "CONSOLE [${m.messageLevel()}] ${m.message()}")
                 return true
             }
         }
@@ -218,9 +223,7 @@ class MainActivity : AppCompatActivity() {
     private fun injectIntoIndex(url: android.net.Uri): WebResourceResponse? {
         val addr = serverAddress ?: return null
         val key = url.toString()
-        if (!hookedUrls.add(key)) {
-            Log.i(TAG, "重复注入 hook: $key")
-        }
+        hookedUrls.add(key)
         var conn: HttpURLConnection? = null
         return try {
             conn = URL(url.toString()).openConnection() as HttpURLConnection
@@ -228,29 +231,19 @@ class MainActivity : AppCompatActivity() {
             conn.readTimeout = 5000
             conn.requestMethod = "GET"
             val code = conn.responseCode
-            if (code !in 200..299) {
-                Log.w(TAG, "取 index.html 失败: HTTP $code")
-                return null
-            }
+            if (code !in 200..299) return null
             val html = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
 
             val script = "<script>" + WsHook.build(addr) + "</script>"
             val patched = insertIntoHead(html, script)
-            if (patched == null) {
-                Log.w(TAG, "index.html 里找不到 <head>，改用 onPageStarted 兜底")
-                return null
-            }
-            Log.i(TAG, "已注入 WebSocket hook -> $addr")
+            if (patched == null) return null
+
             WebResourceResponse(
-                "text/html",
-                "UTF-8",
-                200,
-                "OK",
+                "text/html", "UTF-8", 200, "OK",
                 mapOf("Cache-Control" to "no-store", "Pragma" to "no-cache"),
                 patched.toByteArray(Charsets.UTF_8).inputStream()
             )
         } catch (e: Exception) {
-            Log.w(TAG, "注入失败: ${e.message}")
             null
         } finally {
             try { conn?.disconnect() } catch (_: Exception) {}
@@ -280,21 +273,11 @@ class MainActivity : AppCompatActivity() {
             object {
                 @android.webkit.JavascriptInterface
                 fun onConnectionFailed(reason: String?) {
-                    Log.w(TAG, "WebSocket 连接失败: $reason")
-                    mainHandler.post {
-                        if (isFinishing || isDestroyed) return@post
-                        val target = serverName ?: serverAddress ?: ""
-                        showToastLike("连不上 $target\n请确认对方已开服，或地址填错了")
-                    }
+                    mainHandler.post { showToastLike("连不上服务器") }
                 }
-
                 @android.webkit.JavascriptInterface
                 fun onSocketEvent(event: String?) {
-                    Log.i(TAG, "WebSocket 事件: $event")
-                    mainHandler.post {
-                        if (isFinishing || isDestroyed) return@post
-                        showToastLike("WS: $event")
-                    }
+                    mainHandler.post { showToastLike("WS: $event") }
                 }
             },
             WsHook.BRIDGE_NAME
@@ -315,21 +298,10 @@ class MainActivity : AppCompatActivity() {
             mainHandler.post {
                 if (isFinishing || isDestroyed) return@post
                 val msg = when {
-                    v == "true" -> "联机已接管 → ${serverName ?: serverAddress}"
+                    v == "true" -> "联机已接管"
                     v == "false" -> "联机未生效（仍是单机）"
                     else -> "自检异常：$v"
                 }
-                webView.evaluateJavascript(
-                    "(function(){try{var d=document.getElementById('__sh_diag');" +
-                        "if(!d){d=document.createElement('div');d.id='__sh_diag';" +
-                        "d.style.cssText='position:fixed;z-index:2147483647;left:8px;top:8px;" +
-                        "padding:6px 10px;border-radius:6px;font:12px/1.4 monospace;" +
-                        "background:rgba(0,0,0,.85);color:#0f0;pointer-events:none;" +
-                        "box-shadow:0 2px 8px rgba(0,0,0,.5)';" +
-                        "(document.body||document.documentElement).appendChild(d);}" +
-                        "d.textContent=${jsLiteralForJs(msg)};}catch(e){}})()",
-                    null
-                )
                 if (!hookCheckDone) {
                     hookCheckDone = true
                     showToastLike(msg)
@@ -338,26 +310,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun jsLiteralForJs(s: String): String {
-        val sb = StringBuilder("'")
-        for (c in s) {
-            when (c) {
-                '\\' -> sb.append("\\\\")
-                '\'' -> sb.append("\\'")
-                '\n' -> sb.append("\\n")
-                '\r' -> sb.append("\\r")
-                '<' -> sb.append("\\x3c")
-                else -> sb.append(c)
-            }
-        }
-        return sb.append("'").toString()
-    }
-
     private fun setupImmersiveMode() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         val controller = WindowInsetsControllerCompat(window, window.decorView)
-        controller.systemBarsBehavior =
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         controller.hide(WindowInsetsCompat.Type.systemBars())
     }
 
@@ -365,8 +321,7 @@ class MainActivity : AppCompatActivity() {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
             val controller = WindowInsetsControllerCompat(window, window.decorView)
-            controller.systemBarsBehavior =
-                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             controller.hide(WindowInsetsCompat.Type.systemBars())
         }
     }
@@ -376,31 +331,17 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(serverReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
-            @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(serverReceiver, filter)
         }
     }
 
     private fun startNodeService() {
-        val intent = Intent(this, NodeService::class.java).apply {
-            action = NodeService.ACTION_START
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
-        Log.i(TAG, "已请求启动 NodeService")
+        val intent = Intent(this, NodeService::class.java).apply { action = NodeService.ACTION_START }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
     }
 
     private fun pollHealthAndLoad() {
-        showLoadingPage()
-        
-        // 🌟 补丁：安全检查，防止线程池关闭后崩溃
-        if (isFinishing || isDestroyed || io.isShutdown) {
-            Log.w(TAG, "Activity 已销毁或线程池已关闭，取消本次健康检查")
-            return
-        }
+        if (isFinishing || isDestroyed || io.isShutdown) return
 
         io.execute {
             var ok = false
@@ -409,50 +350,17 @@ class MainActivity : AppCompatActivity() {
                 if (isServerHealthy()) { ok = true; break }
                 if (i % 4 == 0) {
                     val sec = i / 2
-                    mainHandler.post { updateLoadingPage(sec) }
+                    mainHandler.post { 
+                        if (!isFinishing && !isDestroyed && nativeLoadingView.visibility == View.VISIBLE) {
+                            nativeLoadingView.text = "正在启动游戏引擎... 已等待 ${sec} 秒" 
+                        }
+                    }
                 }
                 Thread.sleep(500)
             }
-            Log.i(TAG, "健康检查结果: $ok")
             if (ok) mainHandler.post { loadGame() }
             else mainHandler.post { showErrorAndRetry() }
         }
-    }
-
-    // WebView 内部的次级加载页（在原生加载页之后显示）
-    private fun showLoadingPage() {
-        if (isFinishing || isDestroyed) return
-        webView.loadDataWithBaseURL(
-            null,
-            """
-            <html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-            <style>
-              body{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
-                   flex-direction:column;background:#0d1117;color:#e6edf3;
-                   font-family:sans-serif;text-align:center}
-              .spin{width:44px;height:44px;border:4px solid #30363d;border-top-color:#58a6ff;
-                    border-radius:50%;animation:r 1s linear infinite;margin-bottom:22px}
-              @keyframes r{to{transform:rotate(360deg)}}
-              .t{font-size:17px;margin-bottom:8px}
-              .s{font-size:13px;color:#7d8590}
-            </style></head>
-            <body>
-              <div class="spin"></div>
-              <div class="t">正在启动游戏…</div>
-              <div class="s" id="tip">首次启动需要约 30~60 秒，请稍候</div>
-            </body></html>
-            """.trimIndent(),
-            "text/html", "UTF-8", null
-        )
-    }
-
-    private fun updateLoadingPage(sec: Int) {
-        if (isFinishing || isDestroyed) return
-        webView.evaluateJavascript(
-            "document.getElementById('tip') && " +
-            "(document.getElementById('tip').innerText='已等待 ${'$'}{sec} 秒，仍在启动…')",
-            null
-        )
     }
 
     private fun isServerHealthy(): Boolean {
@@ -464,64 +372,47 @@ class MainActivity : AppCompatActivity() {
             val code = conn.responseCode
             conn.disconnect()
             code in 200..299
-        } catch (e: Exception) {
-            false
-        }
+        } catch (e: Exception) { false }
     }
 
     private fun loadGame() {
         if (webView.url?.startsWith(LOCAL_URL) == true) return
         val suffix = if (serverAddress != null) "?multiplayer=1" else ""
-        Log.i(TAG, "加载游戏页面: $LOCAL_URL/index.html$suffix")
         webView.loadUrl("$LOCAL_URL/index.html$suffix")
     }
 
     private fun showErrorAndRetry() {
+        if (isFinishing || isDestroyed) return
         val hasPack = GamePack.hasActivePack(this)
-        val hint = if (hasPack)
-            "<p>游戏服务还没起来（首次启动加载较慢）。</p>" +
-            "<p style=\"color:#888\">游戏包已成功导入，导入流程本身正常；" +
-            "稍等片刻会自动重试。</p>"
-        else
-            "<p>尚未导入游戏包。</p>" +
-            "<p style=\"color:#888\">请返回上一页点击「导入游戏包 (.zip)」。</p>"
-
-        webView.loadDataWithBaseURL(
-            null,
-            """
-            <html><body style="background:#111;color:#eee;font-family:sans-serif;
-                 display:flex;align-items:center;justify-content:center;flex-direction:column;height:100%;padding:0 24px;text-align:center">
-            <h2>本地服务未就绪</h2>
-            $hint
-            <p style="color:#888">即将自动重试…</p>
-            </body></html>
-            """.trimIndent(),
-            "text/html", "UTF-8", null
-        )
-        mainHandler.postDelayed({ pollHealthAndLoad() }, 3000)
+        nativeLoadingView.text = if (hasPack) {
+            "本地服务未就绪。\n稍等片刻会自动重试..."
+        } else {
+            "尚未导入游戏包。\n请返回上一页导入。"
+        }
+        nativeLoadingView.setTextColor(Color.RED)
+        
+        mainHandler.postDelayed({ 
+            if (!isFinishing && !isDestroyed) {
+                nativeLoadingView.setTextColor(Color.WHITE)
+                pollHealthAndLoad() 
+            }
+        }, 3000)
     }
 
     override fun onResume() {
         super.onResume()
-        // 🌟 补丁：防止线程池关闭后再次闪退
         if (isFinishing || isDestroyed || io.isShutdown) return
-        
         io.execute {
             if (isServerHealthy()) mainHandler.post { loadGame() }
         }
     }
 
     @Deprecated("Deprecated in Java")
-    override fun onBackPressed() {
-        finish()
-    }
+    override fun onBackPressed() { finish() }
 
     override fun onDestroy() {
         try { unregisterReceiver(serverReceiver) } catch (_: Exception) {}
-        
-        // 🌟 补丁：清空所有排队任务，防止 Activity 销毁后延迟任务诈尸
         mainHandler.removeCallbacksAndMessages(null)
-        
         io.shutdown()
         super.onDestroy()
     }
