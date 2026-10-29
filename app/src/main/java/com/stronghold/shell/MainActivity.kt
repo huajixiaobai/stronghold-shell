@@ -19,6 +19,8 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.FrameLayout
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -30,11 +32,7 @@ import java.util.concurrent.Executors
 
 /**
  * 主界面：内嵌一个 WebView，指向本机 Node 服务器（127.0.0.1:3000）。
- *
- * 启动流程：
- *   1. onCreate → AssetHelper.ensureAssetsExtracted()（把 assets/app_bundle.zip 解到私有目录）
- *   2. 启动 NodeService（前台服务，进程内跑 Node）
- *   3. 轮询 /healthz，健康后 WebView 加载 index.html
+ * 优化：引入原生 Loading 页面 + 后台线程解压，解决首次冷启动黑屏问题。
  */
 class MainActivity : AppCompatActivity() {
 
@@ -43,14 +41,13 @@ class MainActivity : AppCompatActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val io = Executors.newSingleThreadExecutor()
 
-    /** 联机模式：远端服务器地址；null 表示单机模式 */
-    private var serverAddress: String? = null
-    /** 联机模式：服务器显示名，仅用于提示 */
-    private var serverName: String? = null
-    /** 已注入过 hook 的页面 URL，避免重复插入 */
-    private val hookedUrls = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    // 🌟 原生加载过渡层
+    private lateinit var rootLayout: FrameLayout
+    private lateinit var nativeLoadingView: TextView
 
-    /** 联机自检是否已执行过（onPageFinished 会多次触发，只弹一次提示） */
+    private var serverAddress: String? = null
+    private var serverName: String? = null
+    private val hookedUrls = java.util.Collections.synchronizedSet(mutableSetOf<String>())
     private var hookCheckDone = false
 
     companion object {
@@ -59,21 +56,11 @@ class MainActivity : AppCompatActivity() {
         const val HEALTH_URL = "$LOCAL_URL/healthz"
         const val ACTION_SERVER_STATE = "com.stronghold.shell.SERVER_STATE"
         const val EXTRA_SERVER_READY = "server_ready"
-
-        /**
-         * 联机模式：远端服务器地址（"host:port"）。
-         * 有值时本页会 hook WebSocket，把 /ws 连接改写到远端；
-         * 页面与素材仍然由手机内的 Node 在 127.0.0.1:3000 提供。
-         */
         const val EXTRA_SERVER_ADDRESS = "server_address"
-        /** 联机模式下用于界面提示的服务器名 */
         const val EXTRA_SERVER_NAME = "server_name"
-
-        /** 需要注入 hook 的入口页面（唯一一个会插入脚本的路径） */
         private const val INDEX_PATH = "/index.html"
     }
 
-    /** 服务状态广播接收器：服务就绪后加载页面 */
     private val serverReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val ready = intent?.getBooleanExtra(EXTRA_SERVER_READY, false) ?: false
@@ -85,46 +72,63 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 0) 读取联机参数。有地址 = 联机模式，无地址 = 单机（行为完全不变）
+        // 0) 读取参数
         serverAddress = intent.getStringExtra(EXTRA_SERVER_ADDRESS)?.takeIf { it.isNotBlank() }
         serverName = intent.getStringExtra(EXTRA_SERVER_NAME)
         Log.i(TAG, "启动模式: " + if (serverAddress == null) "单机" else "联机 -> $serverAddress")
 
-        // 1) 仅在「没有导入游戏包」时，才回退解压 assets 内置资源
-        //    （启动器模式：用户导入的包在 GamePack.activeDir，不需要这步）
-        if (!GamePack.hasActivePack(this)) {
-            AssetHelper.ensureAssetsExtracted(this)
-        }
-        FileLogger.init(this)
-
-        // 2) 创建 WebView
+        // 1) 优先初始化 UI（确保秒出画面，告别黑屏）
         webView = WebView(this)
         webView.setBackgroundColor(Color.BLACK)
-        setContentView(
-            webView,
-            ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-        )
+        
+        rootLayout = FrameLayout(this)
+        nativeLoadingView = TextView(this).apply {
+            text = "正在准备游戏资源，首次启动可能较慢..."
+            setTextColor(Color.WHITE)
+            textSize = 16f
+            gravity = android.view.Gravity.CENTER
+        }
+        
+        rootLayout.addView(nativeLoadingView, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        rootLayout.addView(webView, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        
+        webView.visibility = View.INVISIBLE
+        nativeLoadingView.visibility = View.VISIBLE
+        
+        setContentView(rootLayout)
+
+        // 2) 初始化 WebView 相关配置
         setupWebView()
-
-        // 2.5) 沉浸式全屏：隐藏状态栏 + 导航栏，滑动才临时唤出（需在 setContentView 之后）
         setupImmersiveMode()
-        // 2.6) 联机模式：挂 JS 桥（单机不挂，行为与旧版完全一致）
         installBridgeIfNeeded()
-
-        // 3) 注册服务状态广播
         registerReceiverCompat()
 
-        // 4) 启动 Node 服务
-        startNodeService()
+        // 3) 🌟 将重活（解压、初始化）放到后台线程，防止阻塞主线程导致黑屏
+        io.execute {
+            try {
+                if (!GamePack.hasActivePack(this)) {
+                    AssetHelper.ensureAssetsExtracted(this)
+                }
+                FileLogger.init(this)
+            } catch (e: Exception) {
+                Log.e(TAG, "后台初始化失败", e)
+            }
 
-        // 5) 轮询健康检查（服务可能比 UI 慢）
-        pollHealthAndLoad()
+            // 4) 回到主线程启动服务
+            mainHandler.post {
+                if (isFinishing || isDestroyed) return@post
+                
+                // 更新提示文字
+                nativeLoadingView.text = "正在启动游戏引擎..."
+                
+                startNodeService()
+                pollHealthAndLoad()
 
-        // 6) 联机自检兜底：onPageFinished 不一定会触发（重定向/缓存命中时会被跳过），
-        //    所以改用固定延时轮询，确保诊断一定跑起来
-        if (serverAddress != null) {
-            mainHandler.postDelayed({ runHookSelfCheck() }, 6000)
-            mainHandler.postDelayed({ runHookSelfCheck() }, 15000)
+                if (serverAddress != null) {
+                    mainHandler.postDelayed({ runHookSelfCheck() }, 6000)
+                    mainHandler.postDelayed({ runHookSelfCheck() }, 15000)
+                }
+            }
         }
     }
 
@@ -137,21 +141,15 @@ class MainActivity : AppCompatActivity() {
         settings.allowFileAccess = true
         settings.allowContentAccess = true
         settings.mediaPlaybackRequiresUserGesture = false
-        // 联机模式关键：WebView 混合内容策略。
-        // 页面来自 http://127.0.0.1（被视为安全上下文），联机时 WebSocket 要连
-        // ws://公网IP（明文），默认会被 WebView 当作混合内容静默拦截 —— 表现就是
-        // 服务器一条连接都收不到。这里在联机模式下显式放开。
+        
         if (serverAddress != null) {
             settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
         }
-        // 联机模式下必须绕开缓存：否则 index.html 可能直接来自缓存，
-        // shouldInterceptRequest 不触发 → hook 注不进去（这是联机失效的头号原因）
         settings.cacheMode = if (serverAddress != null) WebSettings.LOAD_NO_CACHE
                              else WebSettings.LOAD_DEFAULT
         settings.useWideViewPort = true
         settings.loadWithOverviewMode = true
 
-        // 本地资源加载器：game.local 域名映射到私有 assets 目录
         assetLoader = WebViewAssetLoader.Builder()
             .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
             .addPathHandler("/res/", WebViewAssetLoader.ResourcesPathHandler(this))
@@ -162,16 +160,21 @@ class MainActivity : AppCompatActivity() {
                 view: WebView,
                 request: WebResourceRequest
             ): WebResourceResponse? {
-                // 1) 联机模式下拦截入口页面，把 WebSocket hook 插到 <head> 最前面
                 if (serverAddress != null && isIndexRequest(request.url)) {
                     injectIntoIndex(request.url)?.let { return it }
                 }
-                // 2) 其余交给 assetLoader（game.local 等自定义域名）
                 return assetLoader.shouldInterceptRequest(request.url)
             }
+            
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                // 联机自检：页面加载完立刻问一句 hook 在不在
+                
+                // 🌟 页面加载完了，WebView 登场，原生文字退场
+                if (!isFinishing && !isDestroyed) {
+                    webView.visibility = View.VISIBLE
+                    nativeLoadingView.visibility = View.GONE
+                }
+
                 if (serverAddress != null) {
                     mainHandler.postDelayed({ runHookSelfCheck() }, 800)
                 }
@@ -183,7 +186,6 @@ class MainActivity : AppCompatActivity() {
                 val m = msg ?: return true
                 val line = "[${m.messageLevel()}] ${m.message()} (${m.sourceId()}:${m.lineNumber()})"
                 Log.i(TAG, "CONSOLE $line")
-                // 联机模式下把 warn/error 直接弹出来，省得抓 logcat
                 if (serverAddress != null &&
                     (m.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.ERROR ||
                      m.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.WARNING)
@@ -201,55 +203,36 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 注入 JS 桥（名字必须与前端约定一致）
         webView.addJavascriptInterface(AndroidBridge(this, webView), "AndroidNative")
-
-        // 长按禁用（游戏内不需要）
         webView.isLongClickable = false
         webView.setOnLongClickListener { true }
     }
 
-    /**
-     * 判断这是不是需要注入的入口页面请求。
-     * 只认本机 Node 上的 /index.html（含根路径），其它一律不碰。
-     */
     private fun isIndexRequest(url: android.net.Uri): Boolean {
         val host = url.host ?: return false
         if (host != "127.0.0.1" && host != "localhost") return false
         val path = url.path ?: return false
-        // 忽略查询串：loadGame 会带 ?multiplayer=1 绕缓存
         return path == INDEX_PATH || path == "/" || path.isEmpty()
     }
 
-    /**
-     * 从本机 Node 取回 index.html，把 WebSocket hook 插到 <head> 之后返回。
-     *
-     * 为什么不用 onPageStarted：那是异步投递的，页面里的内联脚本可能先跑，
-     * 导致上游在 hook 生效前就把 WebSocket 取了引用。在 HTML 里插入 <script>
-     * 能保证 hook 严格先于页面上任何脚本执行。
-     *
-     * 任何异常都返回 null → 退回原生加载，最坏情况是联机不生效但游戏能开。
-     */
     private fun injectIntoIndex(url: android.net.Uri): WebResourceResponse? {
         val addr = serverAddress ?: return null
         val key = url.toString()
         if (!hookedUrls.add(key)) {
-            // 已经注入过（页面刷新/重进），仍要注入，只是记一笔日志
             Log.i(TAG, "重复注入 hook: $key")
         }
+        var conn: HttpURLConnection? = null
         return try {
-            val conn = URL(url.toString()).openConnection() as HttpURLConnection
+            conn = URL(url.toString()).openConnection() as HttpURLConnection
             conn.connectTimeout = 3000
             conn.readTimeout = 5000
             conn.requestMethod = "GET"
             val code = conn.responseCode
             if (code !in 200..299) {
-                conn.disconnect()
                 Log.w(TAG, "取 index.html 失败: HTTP $code")
                 return null
             }
             val html = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-            conn.disconnect()
 
             val script = "<script>" + WsHook.build(addr) + "</script>"
             val patched = insertIntoHead(html, script)
@@ -263,22 +246,17 @@ class MainActivity : AppCompatActivity() {
                 "UTF-8",
                 200,
                 "OK",
-                mapOf(
-                    "Cache-Control" to "no-store",
-                    "Pragma" to "no-cache"
-                ),
+                mapOf("Cache-Control" to "no-store", "Pragma" to "no-cache"),
                 patched.toByteArray(Charsets.UTF_8).inputStream()
             )
         } catch (e: Exception) {
             Log.w(TAG, "注入失败: ${e.message}")
             null
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 
-    /**
-     * 把脚本插到 <head> 标签之后（大小写不敏感）。
-     * 找不到 <head> 时退而插入到 <html> 之后；都没有就返回 null。
-     */
     private fun insertIntoHead(html: String, script: String): String? {
         val headRegex = Regex("<head\\b[^>]*>", RegexOption.IGNORE_CASE)
         val m = headRegex.find(html)
@@ -292,14 +270,9 @@ class MainActivity : AppCompatActivity() {
             val at = m2.range.last + 1
             return html.substring(0, at) + script + html.substring(at)
         }
-        // 连 <html> 都没有（极少数情况）：直接放最前面
         return script + html
     }
 
-    /**
-     * 联机模式下挂一个 JS 桥，用于连接失败时给用户明确提示。
-     * 只暴露一个无参回调，且只在联机模式挂载；单机完全不挂。
-     */
     @SuppressLint("JavascriptInterface")
     private fun installBridgeIfNeeded() {
         if (serverAddress == null) return
@@ -327,22 +300,13 @@ class MainActivity : AppCompatActivity() {
             WsHook.BRIDGE_NAME
         )
     }
-    /** 用一个小浮层提示，不打断游戏（游戏是横屏全屏，Toast 也能用） */
+
     private fun showToastLike(message: String) {
         try {
             android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_LONG).show()
-        } catch (_: Exception) {
-        }
+        } catch (_: Exception) {}
     }
 
-    /**
-     * 联机自检：页面加载完成后问一句 window.__StrongholdHookInstalled。
-     *
-     * 三种结果都明确提示，避免「以为连上了其实没有」：
-     *   - installed=true  → 绿色Toast，提示已接管
-     *   - installed=false → 红色Toast，说清 hook 没进去
-     *   - 异常            → 红色Toast，说清 JS 桥没通
-     */
     private fun runHookSelfCheck() {
         if (isFinishing || isDestroyed) return
         val js = "(function(){try{return String(window." + WsHook.HOOK_FLAG + "===true);}catch(e){return 'ERR:'+e.message;}})()"
@@ -350,7 +314,6 @@ class MainActivity : AppCompatActivity() {
             val v = raw?.trim()?.trim('"') ?: "null"
             mainHandler.post {
                 if (isFinishing || isDestroyed) return@post
-                // 结果同步画到页面上（Toast 只弹一次，屏幕上持续可见）
                 val msg = when {
                     v == "true" -> "联机已接管 → ${serverName ?: serverAddress}"
                     v == "false" -> "联机未生效（仍是单机）"
@@ -375,7 +338,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 把 Kotlin 字符串转成可安全嵌入 JS 的字面量（含引号） */
     private fun jsLiteralForJs(s: String): String {
         val sb = StringBuilder("'")
         for (c in s) {
@@ -391,24 +353,14 @@ class MainActivity : AppCompatActivity() {
         return sb.append("'").toString()
     }
 
-
-    /**
-     * 沉浸式全屏：内容延伸到状态栏/导航栏区域，并隐藏两者。
-     * 用户从边缘滑动时临时唤出，几秒后自动收起（BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE）。
-     */
     private fun setupImmersiveMode() {
-        // 让内容延伸到系统栏区域（配合 hide 才是真全屏）
         WindowCompat.setDecorFitsSystemWindows(window, false)
-
         val controller = WindowInsetsControllerCompat(window, window.decorView)
-        // 系统栏隐藏后，滑动才临时显示
         controller.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        // 隐藏状态栏 + 导航栏
         controller.hide(WindowInsetsCompat.Type.systemBars())
     }
 
-    /** 窗口重新获得焦点时再隐藏一次（有些系统/场景会把系统栏弹回来） */
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
@@ -441,19 +393,10 @@ class MainActivity : AppCompatActivity() {
         Log.i(TAG, "已请求启动 NodeService")
     }
 
-    /**
-     * 轮询健康检查，健康则加载游戏。
-     *
-     * 上游 Node 服务器首次启动需要较长时间（实测几十秒 ~ 1 分钟，
-     * 因为要加载 21165 个文件的站点资源）。故：
-     *   - 轮询上限放宽到 ~90 秒（180 × 500ms）
-     *   - 轮询期间显示「正在启动游戏…」加载页（而非黑屏）
-     *   - 每 2 秒更新一次已等待时间，让用户知道在推进
-     */
     private fun pollHealthAndLoad() {
         showLoadingPage()
         
-        // 🌟 [修复补丁1]：防止 Activity 销毁或线程池关闭后，依然有闹钟叫醒它导致闪退
+        // 🌟 补丁：安全检查，防止线程池关闭后崩溃
         if (isFinishing || isDestroyed || io.isShutdown) {
             Log.w(TAG, "Activity 已销毁或线程池已关闭，取消本次健康检查")
             return
@@ -461,10 +404,10 @@ class MainActivity : AppCompatActivity() {
 
         io.execute {
             var ok = false
-            val maxTries = 180          // 180 × 500ms = 90 秒
+            val maxTries = 180
             for (i in 1..maxTries) {
                 if (isServerHealthy()) { ok = true; break }
-                if (i % 4 == 0) {       // 每 2 秒刷新一次提示
+                if (i % 4 == 0) {
                     val sec = i / 2
                     mainHandler.post { updateLoadingPage(sec) }
                 }
@@ -476,7 +419,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 启动中：显示加载页（替代黑屏） */
+    // WebView 内部的次级加载页（在原生加载页之后显示）
     private fun showLoadingPage() {
         if (isFinishing || isDestroyed) return
         webView.loadDataWithBaseURL(
@@ -503,10 +446,8 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    /** 更新加载页上的等待秒数 */
     private fun updateLoadingPage(sec: Int) {
         if (isFinishing || isDestroyed) return
-        // 只在还停留在加载页时更新
         webView.evaluateJavascript(
             "document.getElementById('tip') && " +
             "(document.getElementById('tip').innerText='已等待 ${'$'}{sec} 秒，仍在启动…')",
@@ -530,18 +471,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun loadGame() {
         if (webView.url?.startsWith(LOCAL_URL) == true) return
-        // 联机模式下加一个查询串，确保 URL 唯一、绕开 WebView 缓存，
-        // 保证 shouldInterceptRequest 一定被调用（否则 hook 注不进去）
         val suffix = if (serverAddress != null) "?multiplayer=1" else ""
         Log.i(TAG, "加载游戏页面: $LOCAL_URL/index.html$suffix")
         webView.loadUrl("$LOCAL_URL/index.html$suffix")
     }
 
-    /** 服务没起来时的兜底提示（黑屏看门狗思路：不崩，只提示 + 重试） */
     private fun showErrorAndRetry() {
-        // 区分两种情形，给用户明确指引：
-        //   ① 有导入包但 Node 没起来 → 多半是首次启动还没加载完 / 被系统回收
-        //   ② 压根没导入包 → 提示先去导入
         val hasPack = GamePack.hasActivePack(this)
         val hint = if (hasPack)
             "<p>游戏服务还没起来（首次启动加载较慢）。</p>" +
@@ -568,19 +503,14 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        // 🌟 [修复补丁2]：防止线程池关闭后，重新回到前台时再次闪退
+        // 🌟 补丁：防止线程池关闭后再次闪退
         if (isFinishing || isDestroyed || io.isShutdown) return
         
-        // 自愈：回到前台时若服务健康但页面没加载好，则重新导航
         io.execute {
             if (isServerHealthy()) mainHandler.post { loadGame() }
         }
     }
 
-    /**
-     * 返回键：退出游戏页，回到启动器（而不是直接退出整个 App）。
-     * Node 服务是前台服务，会继续在后台跑，再次点「启动游戏」可秒回。
-     */
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         finish()
@@ -589,7 +519,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         try { unregisterReceiver(serverReceiver) } catch (_: Exception) {}
         
-        // 🌟 [修复补丁3]：清空主线程中所有还没执行的延迟任务（比如那个3秒重试），防止诈尸闪退
+        // 🌟 补丁：清空所有排队任务，防止 Activity 销毁后延迟任务诈尸
         mainHandler.removeCallbacksAndMessages(null)
         
         io.shutdown()
