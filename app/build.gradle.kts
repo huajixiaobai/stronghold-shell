@@ -11,8 +11,8 @@ android {
         applicationId = "com.stronghold.shell"
         minSdk = 24
         targetSdk = 34
-        versionCode = 3
-        versionName = "2.0.1"
+        versionCode = 20
+        versionName = "2.2.0"
         // 只保留 arm64（与游戏前端一致，体积最小）
         ndk {
             abiFilters += listOf("arm64-v8a")
@@ -32,16 +32,16 @@ android {
         create("stable") {
             dimension = "channel"
             applicationId = "com.stronghold.shell"
-            versionName = "2.0.1"
-            versionCode = 3
+            versionName = "2.2.0"
+            versionCode = 20
             buildConfigField("boolean", "ENABLE_MULTIPLAYER", "false")
             manifestPlaceholders["appLabel"] = "卫戍协议启动器"
         }
         create("lab") {
             dimension = "channel"
             applicationId = "com.stronghold.shell.lab"
-            versionName = "0.1.0-lab"
-            versionCode = 1
+            versionName = "2.2.0"
+            versionCode = 20
             buildConfigField("boolean", "ENABLE_MULTIPLAYER", "true")
             manifestPlaceholders["appLabel"] = "卫戍协议启动器 Lab"
         }
