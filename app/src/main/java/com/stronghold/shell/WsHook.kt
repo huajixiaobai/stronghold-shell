@@ -157,19 +157,31 @@ object WsHook {
     try { window.$HOOK_FLAG = true; } catch (e) {}
 
     // 屏幕横幅：把「hook 是否生效 / 实际连到哪」直接画出来，
-    // 不依赖 Toast（onPageFinished 可能不触发）也不依赖 logcat（被系统屏蔽）
+    // 不依赖 Toast（onPageFinished 可能不触发）也不依赖 logcat（被系统屏蔽）。
+    // 横幅只用于排障，显示 BADGE_SHOW_MS 后自动淡出并移除，不阻挡游戏画面。
     try {
       var mk = function () {
         try {
-          if (document.getElementById('__sh_mp_badge')) return;
+          var old = document.getElementById('__sh_mp_badge');
+          if (old) old.parentNode && old.parentNode.removeChild(old);
           var d = document.createElement('div');
           d.id = '__sh_mp_badge';
           d.style.cssText = 'position:fixed;z-index:2147483647;left:8px;bottom:8px;' +
             'padding:6px 10px;border-radius:6px;font:12px/1.4 monospace;' +
             'background:rgba(0,229,192,.92);color:#111;pointer-events:none;' +
-            'box-shadow:0 2px 8px rgba(0,0,0,.5);max-width:70vw;word-break:break-all';
+            'box-shadow:0 2px 8px rgba(0,0,0,.5);max-width:70vw;word-break:break-all;' +
+            'opacity:1;transition:opacity .5s ease';
           d.textContent = '联机已接管 → ' + TARGET_HOST;
           (document.body || document.documentElement).appendChild(d);
+          // 到点先淡出，再移除；页面来回切也算一次完整展示
+          setTimeout(function () {
+            try {
+              d.style.opacity = '0';
+              setTimeout(function () {
+                try { if (d.parentNode) d.parentNode.removeChild(d); } catch (e2) {}
+              }, 600);
+            } catch (e1) {}
+          }, 3000);
         } catch (e) {}
       };
       if (document.readyState === 'loading') {
