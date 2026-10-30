@@ -1,0 +1,1179 @@
+diff --git a/app/src/main/java/com/stronghold/shell/ImportActivity.kt b/app/src/main/java/com/stronghold/shell/ImportActivity.kt
+index 2d5cb46..4db654c 100644
+--- a/app/src/main/java/com/stronghold/shell/ImportActivity.kt
++++ b/app/src/main/java/com/stronghold/shell/ImportActivity.kt
+@@ -222,7 +222,7 @@ class ImportActivity : AppCompatActivity() {
+             c.addView(lb)
+         }
+ 
+-        val db = UiKit.button(this, "⬇  下载最新完整包", false) { onDownloadLatest() }
++        val db = UiKit.button(this, "⬇  下载 / 更新", false) { onDownloadLatest() }
+         db.layoutParams = cardLp()
+         c.addView(db)
+ 
+@@ -271,7 +271,7 @@ class ImportActivity : AppCompatActivity() {
+             up.addView(row)
+             up.addView(UiKit.spacer(this, 6f))
+             up.addView(UiKit.label(
+-                this, "当前 v${current.version}，最新 v${info.version}。点上方「下载最新完整包」升级。",
++                this, "当前 v${current.version}，最新 v${info.version}。点上方「下载 / 更新」，可选增量更新或完整包。",
+                 12f, UiKit.TEXT_SUB
+             ))
+             c.addView(up, cardLp())
+@@ -713,10 +713,92 @@ class ImportActivity : AppCompatActivity() {
+         }
+         pickPackZip.launch(i)
+     }
+-    /** 导入本地游戏包 zip（后台解压 → 注册版本） */
++    /**
++     * 导入本地 zip —— 自动区分「完整包」与「增量包」。
++     *
++     * 【为什么要分流】原逻辑把任何含 package.json + server/ 的 zip 都当完整包注册成
++     * 新版本，而 -update.zip 恰好两者都有 → 注册出一个没有 node_modules 的残缺版本
++     * → 点启动必崩。现在先探测包类型再决定走哪条路。
++     */
+     private fun doInstallPack(uri: Uri) {
+-        toast("正在导入，请勿退出…")
++        toast("正在检查包…")
+         io.execute {
++            val kind = PackUpdater.detect(this@ImportActivity, uri)
++
++            // ---------- 增量包 → 覆盖到已装版本上 ----------
++            if (kind == PackUpdater.ZipKind.UPDATE) {
++                val active = PackManager.activeDir(this@ImportActivity)
++                if (active == null) {
++                    ui.post { toast("这是增量包，本地还没有完整安装；请先导入完整包") }
++                    return@execute
++                }
++                if (!File(active, "node_modules").isDirectory) {
++                    ui.post { toast("当前版本不完整（缺 node_modules），请先导入完整包") }
++                    return@execute
++                }
++                val from = PackManager.readVersionFrom(active) ?: "未知"
++
++                val latch = java.util.concurrent.CountDownLatch(1)
++                var go = false
++                ui.post {
++                    AlertDialog.Builder(this@ImportActivity)
++                        .setTitle("检测到增量包")
++                        .setMessage(
++                            "本地当前：v$from\n\n" +
++                                "增量包只含改动的文件，会覆盖到 v$from 上。\n" +
++                                "覆盖前自动备份，按 UPDATE.json 校验 from 与 sha256，失败自动回滚。\n\n" +
++                                "⚠️ 只适用于紧邻的上一版；不匹配会被直接拒绝（不动任何文件）。\n" +
++                                "跨版本请用「下载最新」，它会自动逐级升。"
++                        )
++                        .setPositiveButton("开始覆盖") { _, _ -> go = true; latch.countDown() }
++                        .setNegativeButton("取消") { _, _ -> latch.countDown() }
++                        .setOnCancelListener { latch.countDown() }
++                        .show()
++                }
++                latch.await()
++                if (!go) return@execute
++
++                ui.post { toast("正在覆盖，请勿退出…") }
++                val r = PackUpdater.applyOverlay(this@ImportActivity, uri) { stage ->
++                    ui.post { toast(stage) }
++                }
++                ui.post {
++                    if (r.ok) {
++                        toast("增量升级完成：v${r.toVersion}")
++                        updateInfo = null
++                        switchNav(NAV_HOME)
++                    } else {
++                        AlertDialog.Builder(this@ImportActivity)
++                            .setTitle("增量升级失败")
++                            .setMessage(
++                                r.message + "\n\n已回滚到 v${r.fromVersion ?: "原版本"}。\n" +
++                                    "跨版本请改用完整包或「下载最新」。"
++                            )
++                            .setPositiveButton("知道了", null)
++                            .show()
++                    }
++                }
++                return@execute
++            }
++
++            // ---------- 精简包 / 源码包 → 明确拒绝 ----------
++            if (kind == PackUpdater.ZipKind.UNKNOWN) {
++                ui.post {
++                    AlertDialog.Builder(this@ImportActivity)
++                        .setTitle("这不是可用的游戏包")
++                        .setMessage(
++                            "包里既没有 node_modules（完整包），\n" +
++                                "也没有 UPDATE.json（增量包）。\n\n" +
++                                "多半是 lite 精简包或源码包，请换完整包。"
++                        )
++                        .setPositiveButton("知道了", null)
++                        .show()
++                }
++                return@execute
++            }
++
++            // ---------- 完整包 → 原逻辑 ----------
++            toast("正在导入，请勿退出…")
+             var tmp: File? = null
+             try {
+                 val root = PackManager.packsRoot(this@ImportActivity)
+@@ -735,6 +817,10 @@ class ImportActivity : AppCompatActivity() {
+                     ui.post { toast("不是有效的游戏包（缺少 package.json）") }
+                     return@execute
+                 }
++                if (!File(gameDir, "node_modules").isDirectory) {
++                    ui.post { toast("缺 node_modules，请用完整包而非 lite/源码包") }
++                    return@execute
++                }
+                 if (!File(gameDir, "server").exists() && !File(gameDir, "index.js").exists()) {
+                     ui.post { toast("包结构不完整（缺少 server/）") }
+                     return@execute
+@@ -834,36 +920,176 @@ class ImportActivity : AppCompatActivity() {
+             toast("正在下载中…")
+             return
+         }
++        // 空机：没有本地版本，只能下完整包
++        if (PackManager.activeId(this) == null) {
++            startFullDownload()
++            return
++        }
++        // 有本地版本：把「增量更新」和「下载完整包」两个选择都摆出来
++        showUpdateChoice()
++    }
++
++    /**
++     * 更新方式选择：一次网络请求同时拿到「增量计划」和「完整包大小」，两条路都给用户。
++     *
++     * 【两种方式的本质区别】
++     *   增量更新 —— 逐级下载 -update.zip，覆盖进现有版本目录。只下改动文件
++     *              （876 KB ~ 几十 MB），mod / 素材 / 存档都保留；
++     *              受 UPDATE.json 的 from 约束，必须一级一级升。
++     *   完整包   —— 下 800MB 级整包，解压成一个**新的**版本目录，旧版本原样保留，
++     *              可在「游戏版本」列表里随时切换；不受 from 约束，跳几个版本都行。
++     */
++    private fun showUpdateChoice() {
++        toast("正在查询版本列表…")
++        io.execute {
++            val releases = SteppedUpdater.fetchAll()
++            if (releases == null) {
++                ui.post { toast("查询失败，请检查网络后重试") }
++                return@execute
++            }
++            val active = PackManager.activeDir(this@ImportActivity)
++            val cur = active?.let { PackManager.readVersionFrom(it) } ?: ""
++            val plan = if (cur.isEmpty()) SteppedUpdater.Plan(emptyList(), null)
++            else SteppedUpdater.plan(cur, releases)
++            val steps = plan.steps
++
++            // 最新一版：按版本号取最大，不依赖列表顺序
++            val latest = releases.maxWithOrNull { a, b ->
++                when {
++                    UpdateChecker.isNewer(a.version, b.version) -> 1
++                    UpdateChecker.isNewer(b.version, a.version) -> -1
++                    else -> 0
++                }
++            }
++            val fullAsset = latest?.let { UpdateChecker.pickAsset(it, UpdateChecker.PackKind.FULL) }
++
++            ui.post {
++                val rel = latest ?: run {
++                    toast("没有可用的版本信息")
++                    return@post
++                }
++                val full = fullAsset
++                val canIncremental = steps.isNotEmpty()
++                val totalMb = steps.sumOf { if (it.asset.sizeBytes > 0) it.asset.sizeMb else 0.0 }
++
++                val msg = buildString {
++                    append("当前版本：v").append(if (cur.isEmpty()) "未知" else cur).append("\n\n")
++
++                    if (canIncremental) {
++                        append("① 增量更新（推荐）\n")
++                        append("   ").append(steps.joinToString(" → ") { "v${it.to}" })
++                        append("，共 ").append(steps.size).append(" 步，下载约 ")
++                        append("%.1f MB\n".format(totalMb))
++                        append("   覆盖进现有版本，mod / 素材 / 存档保留；\n")
++                        append("   每步校验 sha256，失败自动回滚\n")
++                        if (plan.blockedAt != null) {
++                            append("   ⚠️ v").append(plan.blockedAt)
++                                .append(" 没有发布增量包，只能先升到 v").append(steps.last().to).append("\n")
++                        }
++                        append("\n")
++                    } else if (plan.blockedAt != null) {
++                        append("① 增量更新：不可用（v").append(plan.blockedAt).append(" 没有发布增量包）\n\n")
++                    } else {
++                        append("① 增量更新：当前已是最新版本，无需进行\n\n")
++                    }
++
++                    if (full != null) {
++                        append("② 下载完整包\n")
++                        append("   v").append(rel.version)
++                        if (full.sizeBytes > 0) append("，约 %.1f MB".format(full.sizeMb))
++                        append("\n")
++                        append("   解压成新的版本目录，旧版本保留、可随时切换；跳几个版本都能用\n")
++                    } else {
++                        append("② 下载完整包：该版本没有完整包")
++                    }
++                }
++
++                val b = AlertDialog.Builder(this@ImportActivity)
++                    .setTitle("更新到 v${rel.version}")
++                    .setMessage(msg)
++                    .setNegativeButton("取消", null)
++
++                if (canIncremental) {
++                    b.setPositiveButton("增量更新（%.1f MB）".format(totalMb)) { _, _ -> runStepped() }
++                } else if (full != null) {
++                    b.setPositiveButton("下载完整包") { _, _ -> confirmDownload(rel, full) }
++                }
++                if (canIncremental && full != null) {
++                    b.setNeutralButton(
++                        if (full.sizeBytes > 0) "完整包（%.1f MB）".format(full.sizeMb)
++                        else "下载完整包"
++                    ) { _, _ -> confirmDownload(rel, full) }
++                }
++                b.show()
++            }
++        }
++    }
++
++    /** 只走完整包：空机首装，或用户明确选整包 */
++    private fun startFullDownload() {
+         val info = updateInfo
+-        if (info == null) {
+-            toast("正在查询最新版本…")
+-            checkUpdate(silent = false, thenDownload = true)
++        if (info != null) {
++            proceedDownload(info)
+             return
+         }
+-        proceedDownload(info)
++        toast("正在查询最新版本…")
++        io.execute {
++            val i = UpdateChecker.fetchLatest()
++            ui.post {
++                if (i == null) {
++                    toast("查询失败，请检查网络后重试")
++                } else {
++                    updateInfo = i
++                    proceedDownload(i)
++                }
++            }
++        }
++    }
++
++    /** 真正跑升级链（下载 -> 覆盖 -> 下一级） */
++    private fun runStepped() {
++        downloading = true
++        downloadCard?.visibility = View.VISIBLE
++        downloadLabel?.text = "准备升级…"
++
++        io.execute {
++            val r = SteppedUpdater.run(this@ImportActivity) { s ->
++                ui.post { downloadLabel?.text = s }
++            }
++            downloading = false
++            ui.post {
++                downloadCard?.visibility = View.GONE
++                updateInfo = null
++                if (r.ok) {
++                    toast(r.message)
++                    switchNav(NAV_HOME)
++                } else {
++                    AlertDialog.Builder(this@ImportActivity)
++                        .setTitle("升级未完成")
++                        .setMessage(r.message)
++                        .setPositiveButton("知道了") { _, _ -> switchNav(NAV_HOME) }
++                        .show()
++                }
++            }
++        }
+     }
+ 
+     /**
+-     * 决定下哪种包：
+-     *  - 本地没有这个版本  -> 完整包
+-     *  - 本地已有这个版本  -> 生成增量升级清单（13MB 级），升级失败可回退完整包
++     * 本地没有版本时下完整包。
++     *
++     * 【改动说明】原来这里判断「本地已有同版本才走增量」（it.version == info.version），
++     * 导致本地 0.3.2 + 远程 0.3.3 时 same == null，永远去下 821MB 完整包。
++     * 现在有本地版本的情况统一交给 showUpdateChoice()（增量 / 完整包二选一），
++     * 这里只负责空机首装和「用户明确选了完整包」的下载。
+      */
+     private fun proceedDownload(info: UpdateChecker.ReleaseInfo) {
+-        val packs = PackManager.listPacks(this)
+-        val same = packs.firstOrNull { it.version == info.version }
+-        if (same == null) {
+-            val asset = UpdateChecker.pickAsset(info, UpdateChecker.PackKind.FULL)
+-            if (asset == null) {
+-                toast("该版本没有可下载的完整包")
+-                return
+-            }
+-            preferredKind = UpdateChecker.PackKind.FULL
+-            confirmDownload(info, asset)
++        val asset = UpdateChecker.pickAsset(info, UpdateChecker.PackKind.FULL)
++        if (asset == null) {
++            toast("该版本没有可下载的完整包")
+             return
+         }
+-        // 已装同版本 -> 走增量更新
+-        preferredKind = UpdateChecker.PackKind.UPDATE
+-        confirmIncremental(info, same)
++        preferredKind = UpdateChecker.PackKind.FULL
++        confirmDownload(info, asset)
+     }
+ 
+     private fun confirmDownload(info: UpdateChecker.ReleaseInfo, asset: UpdateChecker.Asset) {
+@@ -1192,8 +1418,8 @@ class ImportActivity : AppCompatActivity() {
+                 preferredMirrors = preferredMirrors
+             )
+ 
+-            dest.delete()
+             if (!ok) {
++                dest.delete()
+                 downloading = false
+                 ui.post {
+                     downloadCard?.visibility = View.GONE
+@@ -1202,56 +1428,31 @@ class ImportActivity : AppCompatActivity() {
+                 return@execute
+             }
+ 
+-            // ---- 备份 -> 覆盖解压 -> 版本校验 ----
+-            val backup = File(same.dir.parentFile, same.dir.name + ".bak")
+-            var backupMade = false
+-            try {
+-                ui.post { downloadLabel?.text = "正在应用增量补丁…" }
+-                backup.deleteRecursively()
+-                backupMade = same.dir.renameTo(backup)
+-                if (!backupMade) {
+-                    FileLogger.log("警告：旧包备份失败，直接在原目录覆盖")
+-                }
+-                val target = same.dir
+-                if (backupMade) target.mkdirs()
+-                ZipInstaller.extractFile(dest, target)
+-
+-                val newVer = PackManager.readVersionFrom(target)
+-                FileLogger.log("增量升级完成：期望 ${info.version}，实际读取 $newVer")
+-
+-                if (newVer == null || !newVer.contains(info.version.removePrefix("v"))) {
+-                    throw IllegalStateException(
+-                        "增量包应用后版本号不符（读到 " + (newVer ?: "无") + "），请改用完整包"
+-                    )
+-                }
++            // ---- 应用补丁：剥包裹 / 备份 / 覆盖 / 删清单 / 校验 / 回滚 全交给 PackUpdater ----
++            ui.post { downloadLabel?.text = "正在应用增量补丁…" }
++            val r = PackUpdater.applyOverlayFile(
++                this@ImportActivity, dest, targetId = same.id
++            ) { stage -> ui.post { downloadLabel?.text = stage } }
++            dest.delete()
++            downloading = false
+ 
+-                backup.deleteRecursively()
+-                PackManager.register(
+-                    this@ImportActivity, target, newVer, source = "github", setActive = true
+-                )
+-                downloading = false
++            if (r.ok) {
++                val newVer = r.toVersion ?: "unknown"
++                FileLogger.log("增量升级完成：${r.fromVersion} -> $newVer")
+                 ui.post {
+                     downloadCard?.visibility = View.GONE
+                     toast("增量升级完成：v$newVer")
+                     updateInfo = null
+                     switchNav(NAV_HOME)
+                 }
+-            } catch (e: Exception) {
+-                FileLogger.log("增量升级失败：" + e.message)
+-                try {
+-                    if (backupMade) {
+-                        same.dir.deleteRecursively()
+-                        backup.renameTo(same.dir)
+-                    }
+-                } catch (_: Exception) {
+-                }
+-                downloading = false
+-                val reason = e.message ?: "未知错误"
++            } else {
++                val reason = r.message
++                FileLogger.log("增量升级失败：" + reason)
+                 ui.post {
+                     downloadCard?.visibility = View.GONE
+                     AlertDialog.Builder(this@ImportActivity)
+                         .setTitle("增量升级失败")
+-                        .setMessage(reason + "\n\n" + "已回滚到原版本，可以改用完整包重试。")
++                        .setMessage(reason + "\n\n已回滚到原版本，可以改用完整包重试。")
+                         .setPositiveButton("用完整包") { _, _ ->
+                             val full = UpdateChecker.pickAsset(info, UpdateChecker.PackKind.FULL)
+                             preferredKind = UpdateChecker.PackKind.FULL
+@@ -1948,8 +2149,12 @@ class ImportActivity : AppCompatActivity() {
+                 }
+ 
+                 if (thenDownload) {
+-                    // 统一走 proceedDownload：已装同版本会自动转成增量升级
+-                    proceedDownload(info)
++                    // 有本地版本 -> 增量 / 完整包二选一；空机 -> 完整包
++                    if (PackManager.activeId(this@ImportActivity) != null) {
++                        showUpdateChoice()
++                    } else {
++                        proceedDownload(info)
++                    }
+                     return@post
+                 }
+ 
+diff --git a/app/src/main/java/com/stronghold/shell/PackDownloader.kt b/app/src/main/java/com/stronghold/shell/PackDownloader.kt
+index fbd87f5..56db635 100644
+--- a/app/src/main/java/com/stronghold/shell/PackDownloader.kt
++++ b/app/src/main/java/com/stronghold/shell/PackDownloader.kt
+@@ -105,15 +105,29 @@ object PackDownloader {
+     /**
+      * 下载通道列表。空前缀 = 直接用官方 URL。
+      *
+-     * 说明：release 的官方 URL 会 302 跳到 objects.githubusercontent.com，
+-     * 这个直链是最原始、最不依赖第三方的路径，必须保留。
++     * 【顺序说明】前 4 项与桌面启动器 updater.cjs 的 mirrors 数组**完全一致**：
++     *   githubproxy.cc → gh-proxy.com → moeyy.cn/gh-proxy → 官方直连（兜底）
++     * 桌面端实测这套顺序可用，所以这里直接沿用，并把官方直连从原来的第一位
++     * 挪到第三位之后 —— 国内环境下直连经常超时，放最前面只会白白拖时间。
++     *
++     * 后面 3 项是壳原有的备选，保留作为额外兜底（顺序靠后，不影响首选）。
++     *
++     * 【什么时候会用到这个顺序】
++     *   1. SteppedUpdater 逐级升级：不走测速，直接按本表顺序试 —— 第一项就是 githubproxy.cc
++     *   2. 用户在「选择下载通道」里点「不测速，直接下」→ PackDownloader.allAsIs()
++     *   3. 测速全部失败时的兜底轮转
++     * 若走了测速（probeAll），结果会按**实测速度**重排，本顺序只作为同速时的参考。
+      */
+     val MIRRORS = listOf(
+-        "" to "GitHub 原版直连",
+-        "https://gh.monlor.com/" to "gh.monlor.com",
++        // ---- 与桌面端一致的 4 项，顺序不要随意调 ----
++        "https://githubproxy.cc/" to "githubproxy.cc",
+         "https://gh-proxy.com/" to "gh-proxy.com",
++        "https://moeyy.cn/gh-proxy/" to "moeyy.cn/gh-proxy",
++        "" to "GitHub 原版直连",
++        // ---- 壳原有备选，仅作兜底 ----
+         "https://ghproxy.net/" to "ghproxy.net",
+-        "https://ghfast.top/" to "ghfast.top"
++        "https://ghfast.top/" to "ghfast.top",
++        "https://gh.monlor.com/" to "gh.monlor.com"
+     )
+ 
+     /** 单个通道的探测结果 */
+diff --git a/app/src/main/java/com/stronghold/shell/PackUpdater.kt b/app/src/main/java/com/stronghold/shell/PackUpdater.kt
+new file mode 100644
+index 0000000..5273eda
+--- /dev/null
++++ b/app/src/main/java/com/stronghold/shell/PackUpdater.kt
+@@ -0,0 +1,448 @@
++package com.stronghold.shell
++
++import android.content.Context
++import android.net.Uri
++import android.util.Log
++import org.json.JSONObject
++import java.io.File
++import java.security.MessageDigest
++import java.util.zip.ZipInputStream
++
++/**
++ * 增量包（-update.zip）覆盖器。
++ *
++ * ============================================================================
++ * 【实测上游 update.zip 结构】v0.3.3，41 条目，876,557 字节
++ *
++ *   Stronghold-Protocol/                  ← 有顶层目录，直接解压会多套一层
++ *     UPDATE.json                         ← 增量清单
++ *     MANIFEST.json                       ← 整包清单
++ *     package.json                        ← 版本号 0.3.3
++ *     server/ public/ shared/ docs/ ...
++ *     node_modules/.package-lock.json     ← 只有一个文件，不是完整 node_modules
++ *
++ * 【实测 UPDATE.json】三个版本的真实内容（字段含义已确认）
++ *
++ *   v0.3.3: app=0.3.3 from=["0.3.2"] count=21   removed=[]
++ *   v0.3.2: app=0.3.2 from=["0.3.1"] count=1097 removed=[{path,sha256:[...]}, ×3]
++ *   v0.3.1: app=0.3.1 from=["0.3.0"] count=388  removed=[{path,sha256:[...]}, ×N]
++ *
++ *   {"format":1, "app":"0.3.3", "from":["0.3.2"], "count":21, "bytes":1513567,
++ *    "removed":[{"path":"server/sim/damage.js","sha256":["ae64cbdc..."]}],
++ *    "files":{"CHANGELOG.md":{"size":222597,"sha256":"c15643a1..."}, ...}}
++ *
++ *   · from     —— 允许的基线版本。**只对紧邻的上一版有效**，所以跨版本必须逐级升
++ *                 （见 SteppedUpdater），不能拿 0.3.3 的补丁直接打 0.3.1。
++ *   · removed  —— 要删除的旧文件，**是对象数组不是字符串数组**，
++ *                 每个带 sha256：只有当前文件确实是这些哈希之一才删，
++ *                 用户改过的文件 / mod 覆盖过的文件不会被误删。
++ *   · files    —— 覆盖后逐个校验 size + sha256。
++ *
++ * ============================================================================
++ * 【桌面启动器（updater.cjs）的可借鉴点】
++ *   1. findProjectRoot  —— 剥包裹目录找真正的项目根（本类 stripWrapper）
++ *   2. blackList        —— 覆盖时保护外壳自己的文件（本类 PROTECTED_PREFIXES）
++ *   3. 强制同步版本号    —— localPkg.version = remoteVersion（本类 forceVersion）
++ *   4. 阶梯式递增        —— 见 SteppedUpdater.kt
++ *
++ * ============================================================================
++ * 【安全顺序】任何一步失败都能回到原样
++ *   解压 → 剥包裹 → 校验 from → rename 备份 → 逐文件覆盖 → 按 removed 删
++ *   → 校验 sha256 → 目录改名 v<新版本> → 写索引；失败全部回滚
++ */
++object PackUpdater {
++
++    private const val TAG = "StrongholdShell"
++
++    enum class ZipKind { FULL, UPDATE, UNKNOWN }
++
++    private const val MAX_SCAN_ENTRIES = 800
++    private const val MAX_SCAN_BYTES = 80L * 1024 * 1024
++
++    /**
++     * 覆盖时**永远不碰**的目录。
++     * 对应桌面版 updater.cjs 的 blackList（那边保护 main.cjs/preload.cjs 等壳文件），
++     * 安卓壳这边没有壳文件在游戏目录里，真正要保护的是玩家的 mod 与 mod 状态：
++     *   workshop/  Forge 工坊 mod
++     *   var/       mod-registry.json 等运行时状态
++     * 上游目前不会往这两个目录塞文件，但补丁里若出现同名路径，跳过比覆盖安全。
++     */
++    private val PROTECTED_PREFIXES = listOf("workshop/", "var/")
++
++    // ==================== 包类型判定 ====================
++
++    /**
++     * 判定 zip 是完整包还是增量包。
++     *   1. 文件名含 "-update"           → 增量包（上游命名固定）
++     *   2. 包内有 UPDATE.json           → 增量包（决定性证据，只有 update 包带）
++     *   3. 包内有 node_modules/<包>/... → 完整包（update 包只有 .package-lock.json）
++     *   4. 都没有                       → 未知（lite / 源码包）
++     *
++     * ZipInputStream 必须解压完条目才能读下一个名字，所以扫描有上限；
++     * 完整包默认就走 FULL，扫不到证据也不影响判断。
++     */
++    fun detect(context: Context, uri: Uri, fileName: String? = null): ZipKind {
++        if (fileName != null && guessKindByName(fileName) == ZipKind.UPDATE) {
++            return ZipKind.UPDATE
++        }
++
++        var hasUpdateJson = false
++        var realNodeModules = 0
++        var entries = 0
++        var bytes = 0L
++        try {
++            context.contentResolver.openInputStream(uri)?.use { ins ->
++                ZipInputStream(ins.buffered()).use { zis ->
++                    var e = zis.nextEntry
++                    while (e != null) {
++                        val n = e.name
++                        if (!n.endsWith("/")) {
++                            entries++
++                            if (n.endsWith("UPDATE.json")) hasUpdateJson = true
++                            if (n.contains("node_modules/") && !n.endsWith(".package-lock.json")) {
++                                realNodeModules++
++                            }
++                            if (e.size > 0) bytes += e.size
++                        }
++                        if (hasUpdateJson || realNodeModules >= 20) break
++                        if (entries >= MAX_SCAN_ENTRIES || bytes >= MAX_SCAN_BYTES) break
++                        zis.closeEntry()
++                        e = zis.nextEntry
++                    }
++                }
++            }
++        } catch (ex: Exception) {
++            Log.w(TAG, "探测包类型失败：${ex.message}")
++            return ZipKind.UNKNOWN
++        }
++
++        return when {
++            hasUpdateJson -> ZipKind.UPDATE
++            realNodeModules >= 20 -> ZipKind.FULL
++            else -> ZipKind.UNKNOWN
++        }
++    }
++
++    /** 只按文件名判断，不解压。给「本地包列表」用。 */
++    fun guessKindByName(name: String): ZipKind = when {
++        name.contains("-update", true) -> ZipKind.UPDATE
++        name.contains("-lite", true) -> ZipKind.UNKNOWN
++        else -> ZipKind.FULL
++    }
++
++    // ==================== 增量清单 ====================
++
++    data class FileSig(val size: Long, val sha256: String)
++
++    /** removed 里的一项：path + 允许被删除的哈希列表（防止误删用户改过的文件） */
++    data class RemovedFile(val path: String, val sha256: List<String>)
++
++    data class UpdateMeta(
++        val app: String,
++        val from: List<String>,
++        val removed: List<RemovedFile>,
++        val files: Map<String, FileSig>
++    )
++
++    fun readUpdateMeta(gameRoot: File): UpdateMeta? {
++        val f = File(gameRoot, "UPDATE.json")
++        if (!f.isFile) return null
++        return try {
++            val j = JSONObject(f.readText())
++
++            val files = LinkedHashMap<String, FileSig>()
++            j.optJSONObject("files")?.let { fo ->
++                for (key in fo.keys()) {
++                    val o = fo.optJSONObject(key) ?: continue
++                    files[key] = FileSig(o.optLong("size", -1L), o.optString("sha256", ""))
++                }
++            }
++
++            val from = ArrayList<String>()
++            j.optJSONArray("from")?.let { fa ->
++                for (i in 0 until fa.length()) from.add(fa.optString(i, ""))
++            }
++
++            // ⚠️ removed 是对象数组：[{"path":"...","sha256":["..."]}, ...]
++            //    不是字符串数组。按字符串解析会全部读成空串，等于没删。
++            val removed = ArrayList<RemovedFile>()
++            j.optJSONArray("removed")?.let { ra ->
++                for (i in 0 until ra.length()) {
++                    when (val item = ra.opt(i)) {
++                        is JSONObject -> {
++                            val p = item.optString("path", "")
++                            if (p.isBlank()) continue
++                            val hashes = ArrayList<String>()
++                            item.optJSONArray("sha256")?.let { ha ->
++                                for (k in 0 until ha.length()) hashes.add(ha.optString(k, ""))
++                            }
++                            removed.add(RemovedFile(p, hashes))
++                        }
++                        is String -> if (item.isNotBlank()) removed.add(RemovedFile(item, emptyList()))
++                    }
++                }
++            }
++
++            UpdateMeta(
++                app = j.optString("app", ""),
++                from = from,
++                removed = removed,
++                files = files
++            )
++        } catch (e: Exception) {
++            Log.w(TAG, "UPDATE.json 解析失败：${e.message}")
++            null
++        }
++    }
++
++    // ==================== 覆盖升级 ====================
++
++    data class Result(
++        val ok: Boolean,
++        val fromVersion: String?,
++        val toVersion: String?,
++        val message: String
++    )
++
++    fun applyOverlay(
++        context: Context,
++        uri: Uri,
++        targetId: String? = null,
++        onStage: (String) -> Unit = {}
++    ): Result = apply(context, targetId, onStage) { stage ->
++        ZipInstaller.extract(context, uri, stage)
++    }
++
++    fun applyOverlayFile(
++        context: Context,
++        zip: File,
++        targetId: String? = null,
++        onStage: (String) -> Unit = {}
++    ): Result = apply(context, targetId, onStage) { stage ->
++        ZipInstaller.extractFile(zip, stage)
++    }
++
++    private fun apply(
++        context: Context,
++        targetId: String?,
++        onStage: (String) -> Unit,
++        extract: (File) -> Unit
++    ): Result {
++        val root = PackManager.packsRoot(context)
++        val activeId = targetId ?: PackManager.activeId(context)
++            ?: return Result(false, null, null, "本地还没有完整安装，增量包不能单独使用")
++
++        val target = File(root, activeId)
++        if (!File(target, "node_modules").isDirectory) {
++            return Result(
++                false, null, null,
++                "当前版本 $activeId 缺少 node_modules，不是完整安装；请先导入完整包"
++            )
++        }
++        val fromVer = PackManager.readVersionFrom(target)
++
++        val stage = File(root, ".overlay")
++        val backup = File(root, "$activeId.bak")
++        var workDir: File = target
++        var renamedTo: File? = null
++
++        try {
++            // ---- 1) 解压 ----
++            stage.deleteRecursively()
++            stage.mkdirs()
++            onStage("正在解压增量包…")
++            extract(stage)
++
++            // ---- 2) 剥包裹目录 ----
++            val base = stripWrapper(stage)
++
++            // ---- 3) 先判断适不适用，不适用就一个文件都不动 ----
++            val meta = readUpdateMeta(base)
++            if (meta != null && meta.from.isNotEmpty() && fromVer != null &&
++                !meta.from.contains(fromVer)
++            ) {
++                return Result(
++                    false, fromVer, null,
++                    "这个增量包只适用于 v${meta.from.joinToString(" / v")}，本地是 v$fromVer。\n" +
++                        "跨版本升级需要逐级进行（见 SteppedUpdater），或直接用完整包。"
++                )
++            }
++            val toVer = meta?.app?.takeIf { it.isNotBlank() }
++                ?: PackManager.readVersionFrom(base)
++                ?: fromVer
++
++            // ---- 4) 备份 ----
++            onStage("正在备份旧版本…")
++            backup.deleteRecursively()
++            if (!target.renameTo(backup)) {
++                return Result(false, fromVer, null, "无法备份旧版本（目录被占用或存储异常），已中止")
++            }
++            workDir.mkdirs()
++
++            // ---- 5) 逐文件覆盖（跳过 workshop/ var/）----
++            onStage("正在覆盖文件…")
++            var moved = 0
++            var copied = 0
++            var skipped = 0
++            base.walkTopDown().forEach { f ->
++                if (f.isFile) {
++                    val rel = f.relativeTo(base).path.replace('\\', '/')
++                    if (PROTECTED_PREFIXES.any { rel.startsWith(it) }) {
++                        skipped++
++                    } else {
++                        val dest = File(workDir, rel)
++                        dest.parentFile?.mkdirs()
++                        if (dest.exists()) dest.delete()
++                        if (f.renameTo(dest)) {
++                            moved++
++                        } else {
++                            f.inputStream().use { i -> dest.outputStream().use { o -> i.copyTo(o) } }
++                            copied++
++                        }
++                    }
++                }
++            }
++            if (skipped > 0) FileLogger.log("覆盖时跳过 $skipped 个 mod/状态目录内的文件")
++
++            // ---- 6) 按 removed 清单删旧文件（带哈希校验，不误删用户改过的文件）----
++            if (meta != null && meta.removed.isNotEmpty()) {
++                var del = 0
++                var keep = 0
++                for (r in meta.removed) {
++                    val f = File(workDir, r.path)
++                    if (!f.isFile || !f.canonicalPath.startsWith(workDir.canonicalPath)) continue
++                    val okToDelete = if (r.sha256.isEmpty()) {
++                        true
++                    } else {
++                        val actual = sha256(f)
++                        r.sha256.any { it.equals(actual, true) }
++                    }
++                    if (okToDelete) {
++                        if (f.delete()) del++
++                    } else {
++                        keep++
++                    }
++                }
++                FileLogger.log("按清单删除 $del 个旧文件" + if (keep > 0) "，$keep 个哈希不符已保留" else "")
++            }
++
++            // ---- 7) 校验 ----
++            onStage("正在校验文件…")
++            if (meta != null && meta.files.isNotEmpty()) {
++                val bad = ArrayList<String>()
++                for ((rel, sig) in meta.files) {
++                    val f = File(workDir, rel)
++                    if (!f.isFile) {
++                        bad.add("$rel（缺失）")
++                    } else if (sig.size >= 0 && f.length() != sig.size) {
++                        bad.add("$rel（大小 ${f.length()} ≠ ${sig.size}）")
++                    } else if (sig.sha256.isNotEmpty() && !sha256(f).equals(sig.sha256, true)) {
++                        bad.add("$rel（sha256 不符）")
++                    }
++                    if (bad.size >= 5) break
++                }
++                if (bad.isNotEmpty()) {
++                    throw IllegalStateException(
++                        "文件校验失败，增量包可能下坏了：\n" + bad.joinToString("\n")
++                    )
++                }
++            }
++            if (GamePack.findEntry(workDir) == null) {
++                throw IllegalStateException("覆盖后找不到入口 server/index.js")
++            }
++            if (!File(workDir, "node_modules").isDirectory) {
++                throw IllegalStateException("覆盖后 node_modules 丢了")
++            }
++
++            // ---- 8) 版本号对齐（照抄桌面版：localPkg.version = remoteVersion）----
++            if (!toVer.isNullOrBlank()) forceVersion(workDir, toVer)
++            val finalVer = PackManager.readVersionFrom(workDir) ?: toVer
++                ?: throw IllegalStateException("覆盖后读不到版本号")
++
++            // ---- 9) 目录名跟着版本走 + 写索引 ----
++            val newId = PackManager.safeId("v$finalVer")
++            if (newId != activeId) {
++                val finalDir = File(root, newId)
++                finalDir.deleteRecursively()
++                if (workDir.renameTo(finalDir)) {
++                    renamedTo = finalDir
++                    workDir = finalDir
++                }
++            }
++            PackManager.register(context, workDir, finalVer, source = "local-update", setActive = true)
++
++            backup.deleteRecursively()
++            stage.deleteRecursively()
++            FileLogger.log(
++                "增量覆盖完成：$fromVer -> $finalVer（rename $moved，copy $copied，" +
++                    "校验 ${meta?.files?.size ?: 0} 个文件）"
++            )
++            return Result(true, fromVer, finalVer, "已升级到 v$finalVer")
++        } catch (e: Exception) {
++            try {
++                renamedTo?.deleteRecursively()
++                if (workDir != target) workDir.deleteRecursively()
++                target.deleteRecursively()
++                if (backup.isDirectory) backup.renameTo(target)
++            } catch (re: Exception) {
++                Log.e(TAG, "回滚失败", re)
++            }
++            stage.deleteRecursively()
++            FileLogger.log("增量覆盖失败：" + (e.message ?: "未知错误"))
++            return Result(false, fromVer, null, e.message ?: "未知错误")
++        }
++    }
++
++    /**
++     * 剥掉单层包裹目录（对应桌面版 findProjectRoot）。
++     * 上游 update.zip 所有条目都在 Stronghold-Protocol/ 下面，不剥就会变成
++     * packs/v0.3.2/Stronghold-Protocol/package.json —— 版本号读不到、游戏跑不起来。
++     * 只在那层里确实有 package.json / server / UPDATE.json 时才剥，
++     * 避免把「只改了 public/ 一个子目录」的补丁误判成包裹层。
++     */
++    private fun stripWrapper(stage: File): File {
++        val kids = stage.listFiles()?.filter { it.name != "__MACOSX" && !it.name.startsWith(".") }
++            ?: return stage
++        if (kids.size != 1 || !kids[0].isDirectory) return stage
++        val only = kids[0]
++        val looksLikeRoot = File(only, "package.json").isFile ||
++            File(only, "server").isDirectory ||
++            File(only, "UPDATE.json").isFile
++        return if (looksLikeRoot) only else stage
++    }
++
++    /**
++     * 把 package.json 的 version 强制写成目标版本。
++     * 桌面版 updater.cjs 就是这么做的（还顺便合并 dependencies）。
++     * 目的：即使上游某个版本的 update.zip 忘了 bump package.json，
++     *      壳里的版本号、目录名也不会和实际内容对不上。
++     */
++    private fun forceVersion(gameRoot: File, version: String) {
++        val pkg = File(gameRoot, "package.json")
++        if (!pkg.isFile) return
++        try {
++            val j = JSONObject(pkg.readText())
++            if (j.optString("version", "") == version) return
++            j.put("version", version)
++            pkg.writeText(j.toString(2))
++            FileLogger.log("package.json 版本号已强制对齐：$version")
++        } catch (e: Exception) {
++            Log.w(TAG, "写 package.json 版本号失败：${e.message}")
++        }
++    }
++
++    private fun sha256(f: File): String {
++        val md = MessageDigest.getInstance("SHA-256")
++        f.inputStream().use { ins ->
++            val buf = ByteArray(64 * 1024)
++            while (true) {
++                val n = ins.read(buf)
++                if (n <= 0) break
++                md.update(buf, 0, n)
++            }
++        }
++        val sb = StringBuilder()
++        for (b in md.digest()) sb.append(String.format("%02x", b))
++        return sb.toString()
++    }
++}
+diff --git a/app/src/main/java/com/stronghold/shell/SteppedUpdater.kt b/app/src/main/java/com/stronghold/shell/SteppedUpdater.kt
+new file mode 100644
+index 0000000..bdcd584
+--- /dev/null
++++ b/app/src/main/java/com/stronghold/shell/SteppedUpdater.kt
+@@ -0,0 +1,259 @@
++package com.stronghold.shell
++
++import android.content.Context
++import android.util.Log
++import org.json.JSONArray
++import java.io.File
++import java.net.HttpURLConnection
++import java.net.URL
++
++/**
++ * 阶梯式跨版本升级（移植自桌面启动器 updater.cjs 的 checkForUpdates/applyUpdate）。
++ *
++ * ============================================================================
++ * 【为什么必须逐级升】
++ *
++ * 上游每个 -update.zip 的 UPDATE.json 里只有紧邻上一版（实测）：
++ *   v0.3.1  from=["0.3.0"]   13.8 MB
++ *   v0.3.2  from=["0.3.1"]   20.8 MB
++ *   v0.3.3  from=["0.3.2"]   876 KB
++ *
++ * 所以 0.3.1 不能直接打 0.3.3 的补丁（会缺文件）。桌面版的做法是：
++ *   拉全部 release → 找「比本地新的里面版本号最小的那个」→ 下它的补丁 → 覆盖
++ *   → 重启后再查 → 再升一级 → 直到没有更新的。
++ * 这里循环跑完全部步骤，中途不需要用户干预，也不需要重启。
++ *
++ * ============================================================================
++ * 【只用 -update.zip，不回退 lite 包】
++ *
++ * 桌面版在缺 update 包时会退回 -lite.zip。实测这条路不可靠，已去掉：
++ *   · lite 是不含素材的另一套完整分发形态，目录内容与增量补丁不是同一语义
++ *   · 覆盖到已装版本上会留下「素材在、代码是 lite 的」这种混合状态，
++ *     上游 README 也明确写了「不适用于精简安装」
++ * 所以遇到某一级没有 -update.zip 时，链条就地停下，明确告诉用户
++ * 「从 vX 起只能用完整包」，而不是硬塞一个 lite 进去。
++ *
++ * ============================================================================
++ * 【与桌面版的对应关系】
++ *   updater.cjs checkForUpdates()    → 本类 fetchAll() + plan()
++ *   updater.cjs applyUpdate()        → 本类 run() 里逐步调用 PackUpdater
++ *   findProjectRoot()                → PackUpdater.stripWrapper()
++ *   blackList                        → PackUpdater.PROTECTED_PREFIXES
++ *   localPkg.version = remoteVersion → PackUpdater.forceVersion()
++ */
++object SteppedUpdater {
++
++    private const val TAG = "StrongholdShell"
++    private const val MAX_STEPS = 15
++    private const val PER_PAGE = 30
++
++    data class Step(
++        val from: String,
++        val to: String,
++        val asset: UpdateChecker.Asset
++    ) {
++        val sizeText: String
++            get() = if (asset.sizeBytes > 0) "%.1f MB".format(asset.sizeMb) else "大小未知"
++    }
++
++    /**
++     * 升级计划。
++     * @param steps     依次要走的步骤
++     * @param blockedAt 因为「该版本没有 -update.zip」而停下的那个版本号；
++     *                  为 null 表示能一路升到最新
++     */
++    data class Plan(val steps: List<Step>, val blockedAt: String?)
++
++    data class Result(
++        val ok: Boolean,
++        val fromVersion: String?,
++        val toVersion: String?,
++        val applied: List<String>,
++        val message: String
++    )
++
++    // ==================== 拉版本列表 ====================
++
++    /**
++     * 取上游全部 release（按发布时间倒序）。对应桌面版请求
++     * `/repos/owner/repo/releases` 那一步。直连失败时走 ghproxy。
++     */
++    fun fetchAll(): List<UpdateChecker.ReleaseInfo>? {
++        val apiPath = "/repos/${UpdateChecker.OWNER}/${UpdateChecker.REPO}/releases?per_page=$PER_PAGE"
++        val urls = listOf(
++            "https://api.github.com$apiPath",
++            "https://ghproxy.net/https://api.github.com$apiPath"
++        )
++        for (u in urls) {
++            try {
++                val conn = URL(u).openConnection() as HttpURLConnection
++                conn.connectTimeout = 12000
++                conn.readTimeout = 20000
++                conn.setRequestProperty("User-Agent", "StrongholdShell-Launcher")
++                conn.setRequestProperty("Accept", "application/vnd.github+json")
++                val code = conn.responseCode
++                if (code != 200) {
++                    conn.disconnect()
++                    Log.w(TAG, "版本列表 $code：$u")
++                    continue
++                }
++                val text = conn.inputStream.bufferedReader().use { it.readText() }
++                conn.disconnect()
++                val list = parseReleases(text)
++                if (list.isNotEmpty()) return list
++            } catch (e: Exception) {
++                Log.w(TAG, "版本列表请求失败：${e.message}")
++            }
++        }
++        return null
++    }
++
++    private fun parseReleases(text: String): List<UpdateChecker.ReleaseInfo> {
++        val out = ArrayList<UpdateChecker.ReleaseInfo>()
++        val arr = JSONArray(text)
++        for (i in 0 until arr.length()) {
++            val j = arr.optJSONObject(i) ?: continue
++            val tag = j.optString("tag_name", "")
++            if (tag.isEmpty()) continue
++            val assets = ArrayList<UpdateChecker.Asset>()
++            j.optJSONArray("assets")?.let { aa ->
++                for (k in 0 until aa.length()) {
++                    val a = aa.optJSONObject(k) ?: continue
++                    assets.add(
++                        UpdateChecker.Asset(
++                            name = a.optString("name", ""),
++                            sizeBytes = a.optLong("size", 0),
++                            downloadUrl = a.optString("browser_download_url", "")
++                        )
++                    )
++                }
++            }
++            out.add(
++                UpdateChecker.ReleaseInfo(
++                    tag = tag,
++                    version = tag.removePrefix("v").removePrefix("V"),
++                    name = j.optString("name", tag),
++                    publishedAt = j.optString("published_at", ""),
++                    body = j.optString("body", ""),
++                    assets = assets
++                )
++            )
++        }
++        return out
++    }
++
++    // ==================== 规划升级路径 ====================
++
++    /**
++     * 算出从 current 到最新要走的每一步。
++     * 只接受 -update.zip；某一级缺增量包就停在它前面（blockedAt 记下它），
++     * 不会拿 lite 包顶替 —— lite 覆盖会得到「素材在、代码是 lite」的混合状态。
++     */
++    fun plan(current: String, releases: List<UpdateChecker.ReleaseInfo>): Plan {
++        // 只留比本地新的，按版本升序
++        val newer = releases.filter { UpdateChecker.isNewer(it.version, current) }
++            .sortedWith { a, b -> if (UpdateChecker.isNewer(a.version, b.version)) 1 else -1 }
++
++        val steps = ArrayList<Step>()
++        var cur = current
++        var blockedAt: String? = null
++
++        for (r in newer) {
++            if (!UpdateChecker.isNewer(r.version, cur)) continue
++            val update = r.assets.firstOrNull { it.name.endsWith("-update.zip") }
++            if (update == null) {
++                // 缺这一级的补丁 -> 链条到此为止
++                blockedAt = r.version
++                break
++            }
++            steps.add(Step(from = cur, to = r.version, asset = update))
++            cur = r.version
++            if (steps.size >= MAX_STEPS) break
++        }
++        return Plan(steps, blockedAt)
++    }
++
++    // ==================== 执行 ====================
++
++    /**
++     * 从当前激活版本一路升到最新。每步：下载补丁 → PackUpdater 覆盖 → 继续下一级。
++     * 任何一步失败就停在那里（已完成的步骤保留，不回退整条链）。
++     */
++    fun run(context: Context, onStage: (String) -> Unit = {}): Result {
++        val activeId = PackManager.activeId(context)
++            ?: return Result(false, null, null, emptyList(), "还没有安装游戏包")
++
++        val activeDir = File(PackManager.packsRoot(context), activeId)
++        val start = PackManager.readVersionFrom(activeDir)
++            ?: return Result(false, null, null, emptyList(), "读不到当前版本号")
++
++        onStage("正在查询版本列表…")
++        val releases = fetchAll()
++            ?: return Result(false, start, start, emptyList(), "查询版本列表失败（网络或 GitHub 限流）")
++
++        val plan = plan(start, releases)
++        val steps = plan.steps
++        if (steps.isEmpty()) {
++            val why = if (plan.blockedAt != null) {
++                "v${plan.blockedAt} 没有增量包，请用完整包升级"
++            } else {
++                "已经是最新版本 v$start"
++            }
++            return Result(true, start, start, emptyList(), why)
++        }
++
++        val totalMb = steps.sumOf { if (it.asset.sizeBytes > 0) it.asset.sizeMb else 0.0 }
++        onStage(
++            "需要 ${steps.size} 步：" + steps.joinToString(" → ") { "v${it.to}" } +
++                "（合计约 %.1f MB）".format(totalMb)
++        )
++
++        val applied = ArrayList<String>()
++        var cur = start
++        var index = 0
++
++        for (step in steps) {
++            index++
++            // 每步都要重新取 activeId：PackUpdater 成功后会把目录改名成 v<新版本>
++            val tid = PackManager.activeId(context) ?: activeId
++            val dest = File(PackDownloader.downloadDir(context), step.asset.name)
++
++            onStage("[$index/${steps.size}] 下载 v${step.to} 补丁（${step.sizeText}）…")
++            val dlOk = PackDownloader.download(
++                url = step.asset.downloadUrl,
++                dest = dest,
++                expectedSize = step.asset.sizeBytes
++            )
++            if (!dlOk) {
++                dest.delete()
++                return Result(
++                    false, start, cur, applied,
++                    "v${step.to} 的补丁下载失败（已升到 v$cur，可重试继续）"
++                )
++            }
++
++            onStage("[$index/${steps.size}] 正在应用 v$cur → v${step.to}…")
++            val r = PackUpdater.applyOverlayFile(context, dest, targetId = tid) { s ->
++                onStage("[$index/${steps.size}] $s")
++            }
++            dest.delete()
++
++            if (!r.ok) {
++                return Result(
++                    false, start, cur, applied,
++                    "v${step.to} 应用失败：${r.message}\n（已升到 v$cur，当前版本可用）"
++                )
++            }
++            cur = r.toVersion ?: step.to
++            applied.add(cur)
++        }
++
++        val tail = if (plan.blockedAt != null) {
++            "\nv${plan.blockedAt} 没有增量包，后续版本请用完整包"
++        } else ""
++        val msg = if (cur == start) "已经是最新版本 v$start" else "已从 v$start 升到 v$cur"
++        onStage(msg + tail)
++        FileLogger.log("阶梯升级完成：$msg（路径 ${applied.joinToString(" → ")}）")
++        return Result(true, start, cur, applied, msg + tail)
++    }
++}

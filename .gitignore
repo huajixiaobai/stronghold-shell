@@ -33,3 +33,7 @@ out/
 
 # 系统
 .DS_Store
+
+# 本地调试产物 / 从设备拉下来的数据（含服务器地址，不入库）
+.workbuddy-ai/
+srv.xml

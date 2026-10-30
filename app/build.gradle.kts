@@ -11,8 +11,8 @@ android {
         applicationId = "com.stronghold.shell"
         minSdk = 24
         targetSdk = 34
-        versionCode = 3
-        versionName = "2.0.1"
+        versionCode = 5
+        versionName = "2.0.3"
         // 只保留 arm64（与游戏前端一致，体积最小）
         ndk {
             abiFilters += listOf("arm64-v8a")
@@ -21,8 +21,8 @@ android {
 
     // ===== 构建变体：stable（正式）/ lab（联机实验） =====
     // 两个变体共用同一份源码，只有 applicationId、版本号和一个开关不同。
-    //   stable：com.stronghold.shell       2.0.1      不含多人游戏入口
-    //   lab   ：com.stronghold.shell.lab   0.1.0-lab  含多人游戏入口
+    //   stable：com.stronghold.shell       2.0.3      不含多人游戏入口
+    //   lab   ：com.stronghold.shell.lab   0.2.1-lab  含多人游戏入口
     // 包名不同 → 可以和正式版同时装在手机上，互不覆盖。
     //
     // 注意：flavor 名不能叫 "main"，会和默认 sourceSet 撞车（Gradle 报
@@ -32,16 +32,16 @@ android {
         create("stable") {
             dimension = "channel"
             applicationId = "com.stronghold.shell"
-            versionName = "2.0.1"
-            versionCode = 3
+            versionName = "2.0.3"
+            versionCode = 5
             buildConfigField("boolean", "ENABLE_MULTIPLAYER", "false")
             manifestPlaceholders["appLabel"] = "卫戍协议启动器"
         }
         create("lab") {
             dimension = "channel"
             applicationId = "com.stronghold.shell.lab"
-            versionName = "0.1.0-lab"
-            versionCode = 1
+            versionName = "0.2.1-lab"
+            versionCode = 3
             buildConfigField("boolean", "ENABLE_MULTIPLAYER", "true")
             manifestPlaceholders["appLabel"] = "卫戍协议启动器 Lab"
         }

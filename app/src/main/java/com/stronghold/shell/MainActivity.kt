@@ -14,6 +14,7 @@ import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -47,11 +48,55 @@ class MainActivity : AppCompatActivity() {
     private var serverAddress: String? = null
     /** 联机模式：服务器显示名，仅用于提示 */
     private var serverName: String? = null
+    /** 联机模式：服务器是否走加密连接（wss） */
+    private var serverTls: Boolean = false
     /** 已注入过 hook 的页面 URL，避免重复插入 */
     private val hookedUrls = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
     /** 联机自检是否已执行过（onPageFinished 会多次触发，只弹一次提示） */
     private var hookCheckDone = false
+
+    /**
+     * 当前处于「已连接」状态的 WebSocket 集合。
+     *
+     * 为什么要按 id 记：游戏在同一页面里可能同时开着多条 WS（大厅一条、房间一条），
+     * 旧的那条正常关闭时并不代表联机断了。只按「有没有收到过 close」判断会误报，
+     * 用户就会看到「未连接 / 已连接」来回弹 —— 实际上连接一直是好的。
+     */
+    private val openSockets = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+    /** 「已联机」成功提示只弹一次，之后的重连一律静默 */
+    private var onlineAnnounced = false
+
+    /** 「联机已断开」提示是否已弹过，避免掉线期间反复刷屏 */
+    private var offlineAnnounced = false
+
+    /** 断线确认延时任务：短时间内的抖动（重连、切换场景）不提示 */
+    private val offlineConfirm = Runnable {
+        if (isFinishing || isDestroyed) return@Runnable
+        if (openSockets.isNotEmpty() || offlineAnnounced) return@Runnable
+        offlineAnnounced = true
+        val target = serverName ?: serverAddress ?: ""
+        showToastLike("联机已断开 → $target\n正在自动重连…")
+    }
+
+    /**
+     * 主框架加载失败后的自动重试次数。
+     *
+     * 为什么需要：Node 线程刚起来时端口还没监听，而 NodeRunner 会先发「已就绪」广播，
+     * 于是 WebView 可能抢在端口就绪之前请求 index.html，拿到 ERR_CONNECTION_REFUSED。
+     * 此时页面里只剩 WebView 自带的黑底错误页（表现为"黑屏"），必须回到加载页重试。
+     */
+    private var loadRetries = 0
+    private val maxLoadRetries = 5
+
+    /** 是否已有健康检查线程在跑（防止重试时叠加多个轮询） */
+    @Volatile
+    private var polling = false
+
+    /** 最近一次导航是否以错误页告终（用于 onResume 自愈时判断要不要重新导航） */
+    @Volatile
+    private var lastLoadFailed = false
 
     companion object {
         private const val TAG = "StrongholdShell"
@@ -68,6 +113,8 @@ class MainActivity : AppCompatActivity() {
         const val EXTRA_SERVER_ADDRESS = "server_address"
         /** 联机模式下用于界面提示的服务器名 */
         const val EXTRA_SERVER_NAME = "server_name"
+        /** 该服务器是否走加密连接（wss / https），由 ServerStore 规范化时判定 */
+        const val EXTRA_SERVER_TLS = "server_tls"
 
         /** 需要注入 hook 的入口页面（唯一一个会插入脚本的路径） */
         private const val INDEX_PATH = "/index.html"
@@ -88,7 +135,9 @@ class MainActivity : AppCompatActivity() {
         // 0) 读取联机参数。有地址 = 联机模式，无地址 = 单机（行为完全不变）
         serverAddress = intent.getStringExtra(EXTRA_SERVER_ADDRESS)?.takeIf { it.isNotBlank() }
         serverName = intent.getStringExtra(EXTRA_SERVER_NAME)
-        Log.i(TAG, "启动模式: " + if (serverAddress == null) "单机" else "联机 -> $serverAddress")
+        serverTls = intent.getBooleanExtra(EXTRA_SERVER_TLS, false)
+        Log.i(TAG, "启动模式: " + if (serverAddress == null) "单机"
+            else "联机 -> $serverAddress" + if (serverTls) "（wss）" else "（ws）")
 
         // 1) 仅在「没有导入游戏包」时，才回退解压 assets 内置资源
         //    （启动器模式：用户导入的包在 GamePack.activeDir，不需要这步）
@@ -171,10 +220,41 @@ class MainActivity : AppCompatActivity() {
             }
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
+                // 页面正常加载完成 → 重置重试计数
+                if (url?.startsWith(LOCAL_URL) == true) loadRetries = 0
                 // 联机自检：页面加载完立刻问一句 hook 在不在
                 if (serverAddress != null) {
                     mainHandler.postDelayed({ runHookSelfCheck() }, 800)
                 }
+            }
+
+            /**
+             * 主框架加载失败（典型：Node 端口还没起来 → ERR_CONNECTION_REFUSED）。
+             *
+             * 不把 WebView 自带的黑底错误页留给用户，而是退回「正在启动游戏…」
+             * 加载页，并在短暂延时后重新轮询健康检查 → 重新加载。
+             */
+            override fun onReceivedError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                error: WebResourceError?
+            ) {
+                super.onReceivedError(view, request, error)
+                val isMain = request?.isForMainFrame ?: false
+                val url = request?.url?.toString() ?: return
+                Log.w(TAG, "页面加载失败: $url -> ${error?.errorCode} ${error?.description}")
+                if (!isMain || !url.startsWith(LOCAL_URL)) return
+                lastLoadFailed = true
+                if (loadRetries >= maxLoadRetries) {
+                    Log.e(TAG, "重试 $loadRetries 次仍失败，保留错误页")
+                    return
+                }
+                loadRetries++
+                mainHandler.postDelayed({
+                    if (isFinishing || isDestroyed) return@postDelayed
+                    showLoadingPage()
+                    pollHealthAndLoad()
+                }, 600)
             }
         }
 
@@ -251,7 +331,7 @@ class MainActivity : AppCompatActivity() {
             val html = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
             conn.disconnect()
 
-            val script = "<script>" + WsHook.build(addr) + "</script>"
+            val script = "<script>" + WsHook.build(addr, serverTls) + "</script>"
             val patched = insertIntoHead(html, script)
             if (patched == null) {
                 Log.w(TAG, "index.html 里找不到 <head>，改用 onPageStarted 兜底")
@@ -297,8 +377,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 联机模式下挂一个 JS 桥，用于连接失败时给用户明确提示。
-     * 只暴露一个无参回调，且只在联机模式挂载；单机完全不挂。
+     * 联机模式下挂一个 JS 桥，用于连接状态提示。
+     * 只在联机模式挂载；单机完全不挂。
+     *
+     * 【提示策略】宁缺勿滥 —— 联机本身没断时绝不该弹窗。
+     *   - 第一次连上：弹一次「已联机 → 地址」
+     *   - 之后的重连/切换场景：完全静默（游戏会频繁开关 WS，逐条提示就是刷屏）
+     *   - 确实掉了：先等 [OFFLINE_CONFIRM_DELAY] 再确认，期间连上就当没发生
+     *   - 掉线后重新连上：弹一次「已重新连上」，仅当之前确实报过掉线
      */
     @SuppressLint("JavascriptInterface")
     private fun installBridgeIfNeeded() {
@@ -308,29 +394,72 @@ class MainActivity : AppCompatActivity() {
                 @android.webkit.JavascriptInterface
                 fun onConnectionFailed(reason: String?) {
                     Log.w(TAG, "WebSocket 连接失败: $reason")
-                    mainHandler.post {
-                        if (isFinishing || isDestroyed) return@post
-                        val target = serverName ?: serverAddress ?: ""
-                        showToastLike("连不上 $target\n请确认对方已开服，或地址填错了")
-                    }
+                    // 不立刻弹：可能只是重连过程中的一次失败，交给延时确认
+                    mainHandler.post { scheduleOfflineConfirm() }
                 }
 
                 @android.webkit.JavascriptInterface
                 fun onSocketEvent(event: String?) {
                     Log.i(TAG, "WebSocket 事件: $event")
+                    val e = event ?: return
+                    // 格式：LINK_OK|<id>   /   LINK_CLOSED|<id>|<code>
+                    val parts = e.split('|')
+                    val id = parts.getOrNull(1) ?: return
                     mainHandler.post {
                         if (isFinishing || isDestroyed) return@post
-                        showToastLike("WS: $event")
+                        when (parts[0]) {
+                            "LINK_OK" -> onSocketUp(id)
+                            "LINK_CLOSED" -> onSocketDown(id)
+                        }
                     }
                 }
             },
             WsHook.BRIDGE_NAME
         )
     }
-    /** 用一个小浮层提示，不打断游戏（游戏是横屏全屏，Toast 也能用） */
+
+    /** 掉线确认延时：这段时间内重连成功就不提示（游戏切场景/心跳重连时会短暂断一下） */
+    private val OFFLINE_CONFIRM_DELAY = 10000L
+
+    private fun onSocketUp(id: String) {
+        openSockets.add(id)
+        mainHandler.removeCallbacks(offlineConfirm)
+        val target = serverName ?: serverAddress ?: ""
+        when {
+            // 之前报过掉线，这次是真恢复了
+            offlineAnnounced -> {
+                offlineAnnounced = false
+                showToastLike("已重新连上 → $target")
+            }
+            // 第一次连上，报一次
+            !onlineAnnounced -> {
+                onlineAnnounced = true
+                showToastLike("已联机 → $target")
+            }
+            // 其余都是重连/多连接，静默
+        }
+    }
+
+    private fun onSocketDown(id: String) {
+        openSockets.remove(id)
+        if (openSockets.isNotEmpty()) return   // 还有别的连接活着，不算断
+        scheduleOfflineConfirm()
+    }
+
+    private fun scheduleOfflineConfirm() {
+        if (openSockets.isNotEmpty()) return
+        mainHandler.removeCallbacks(offlineConfirm)
+        mainHandler.postDelayed(offlineConfirm, OFFLINE_CONFIRM_DELAY)
+    }
+    /**
+     * 用 Toast 提示，不打断游戏（游戏是横屏全屏，Toast 也能用）。
+     *
+     * 一律用 LENGTH_SHORT（约 2 秒）：之前用 LENGTH_LONG（约 3.5 秒），
+     * 全屏游戏里一条横贯屏幕的提示压那么久很碍事，而且这些文案都短，够看。
+     */
     private fun showToastLike(message: String) {
         try {
-            android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_LONG).show()
+            android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_SHORT).show()
         } catch (_: Exception) {
         }
     }
@@ -338,59 +467,39 @@ class MainActivity : AppCompatActivity() {
     /**
      * 联机自检：页面加载完成后问一句 window.__StrongholdHookInstalled。
      *
-     * 三种结果都明确提示，避免「以为连上了其实没有」：
-     *   - installed=true  → 绿色Toast，提示已接管
-     *   - installed=false → 红色Toast，说清 hook 没进去
-     *   - 异常            → 红色Toast，说清 JS 桥没通
+     * 只报「没接上」的情况，成功一律静默：
+     *   - installed=true  → 不提示，等 WebSocket 真连上时由 onSocketEvent 弹「已联机」
+     *   - installed=false → 提示 hook 没进去
+     *   - 异常            → 提示 JS 桥没通
+     * 这样成功路径上只有一条 Toast，不会和「联机已接管」重复。
      */
     private fun runHookSelfCheck() {
         if (isFinishing || isDestroyed) return
+        // 只在真正的游戏页上自检。
+        // 「正在启动游戏…」加载页是 loadDataWithBaseURL 渲染的，它同样会触发
+        // onPageFinished，但那个上下文里当然没有 hook —— 不排除掉就会误报
+        // 「联机未生效（仍是单机）」，让用户以为联机坏了。
+        if (webView.url?.startsWith(LOCAL_URL) != true) return
         val js = "(function(){try{return String(window." + WsHook.HOOK_FLAG + "===true);}catch(e){return 'ERR:'+e.message;}})()"
         webView.evaluateJavascript(js) { raw ->
             val v = raw?.trim()?.trim('"') ?: "null"
-            mainHandler.post {
-                if (isFinishing || isDestroyed) return@post
-                // 结果同步画到页面上（Toast 只弹一次，屏幕上持续可见）
-                val msg = when {
-                    v == "true" -> "联机已接管 → ${serverName ?: serverAddress}"
-                    v == "false" -> "联机未生效（仍是单机）"
-                    else -> "自检异常：$v"
-                }
-                webView.evaluateJavascript(
-                    "(function(){try{var d=document.getElementById('__sh_diag');" +
-                        "if(!d){d=document.createElement('div');d.id='__sh_diag';" +
-                        "d.style.cssText='position:fixed;z-index:2147483647;left:8px;top:8px;" +
-                        "padding:6px 10px;border-radius:6px;font:12px/1.4 monospace;" +
-                        "background:rgba(0,0,0,.85);color:#0f0;pointer-events:none;" +
-                        "box-shadow:0 2px 8px rgba(0,0,0,.5)';" +
-                        "(document.body||document.documentElement).appendChild(d);}" +
-                        "d.textContent=${jsLiteralForJs(msg)};}catch(e){}})()",
-                    null
-                )
-                if (!hookCheckDone) {
-                    hookCheckDone = true
-                    showToastLike(msg)
+            if (v != "true") {
+                mainHandler.post {
+                    if (isFinishing || isDestroyed) return@post
+                    val msg = when {
+                        v == "false" -> "联机未生效（仍是单机）"
+                        else -> "自检异常：$v"
+                    }
+                    // 只做一次性 Toast 提示，不再往页面上画常驻横幅
+                    // （那个 __sh_diag 会一直浮在左上角遮挡游戏 HUD）
+                    if (!hookCheckDone) {
+                        hookCheckDone = true
+                        showToastLike(msg)
+                    }
                 }
             }
         }
     }
-
-    /** 把 Kotlin 字符串转成可安全嵌入 JS 的字面量（含引号） */
-    private fun jsLiteralForJs(s: String): String {
-        val sb = StringBuilder("'")
-        for (c in s) {
-            when (c) {
-                '\\' -> sb.append("\\\\")
-                '\'' -> sb.append("\\'")
-                '\n' -> sb.append("\\n")
-                '\r' -> sb.append("\\r")
-                '<' -> sb.append("\\x3c")
-                else -> sb.append(c)
-            }
-        }
-        return sb.append("'").toString()
-    }
-
 
     /**
      * 沉浸式全屏：内容延伸到状态栏/导航栏区域，并隐藏两者。
@@ -452,6 +561,19 @@ class MainActivity : AppCompatActivity() {
      */
     private fun pollHealthAndLoad() {
         showLoadingPage()
+
+        // 🌟 [修复补丁1]：防止 Activity 销毁或线程池关闭后，依然有闹钟叫醒它导致闪退
+        if (isFinishing || isDestroyed || io.isShutdown) {
+            Log.w(TAG, "Activity 已销毁或线程池已关闭，取消本次健康检查")
+            return
+        }
+        // 避免重试时叠加多个轮询线程
+        if (polling) {
+            Log.i(TAG, "已有健康检查在跑，跳过本次")
+            return
+        }
+        polling = true
+
         io.execute {
             var ok = false
             val maxTries = 180          // 180 × 500ms = 90 秒
@@ -463,8 +585,9 @@ class MainActivity : AppCompatActivity() {
                 }
                 Thread.sleep(500)
             }
+            polling = false
             Log.i(TAG, "健康检查结果: $ok")
-            if (ok) mainHandler.post { loadGame() }
+            if (ok) mainHandler.post { loadGame(force = true) }
             else mainHandler.post { showErrorAndRetry() }
         }
     }
@@ -521,8 +644,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun loadGame() {
-        if (webView.url?.startsWith(LOCAL_URL) == true) return
+    /**
+     * 加载游戏页面。
+     *
+     * @param force true 时忽略「已经在 LOCAL_URL 上」的判断，强制重新加载。
+     *        健康检查成功后必须用 force=true：首次加载可能因为 Node 端口还没监听
+     *        而失败，此时 webView.url 已经是 LOCAL_URL，不加 force 就永远不会重试，
+     *        用户看到的就是 WebView 的黑底错误页（"黑屏"）。
+     */
+    private fun loadGame(force: Boolean = false) {
+        if (!force && webView.url?.startsWith(LOCAL_URL) == true) return
+        lastLoadFailed = false
+        // 重新加载 = 旧页面的 WebSocket 全部作废，清掉记账避免残留 id 把「已断开」压住
+        openSockets.clear()
         // 联机模式下加一个查询串，确保 URL 唯一、绕开 WebView 缓存，
         // 保证 shouldInterceptRequest 一定被调用（否则 hook 注不进去）
         val suffix = if (serverAddress != null) "?multiplayer=1" else ""
@@ -561,23 +695,33 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        // 自愈：回到前台时若服务健康但页面没加载好，则重新导航
+        // 🌟 [修复补丁2]：防止线程池关闭后，重新回到前台时再次闪退
+        if (isFinishing || isDestroyed || io.isShutdown) return
+        
+        // 自愈：回到前台时若服务健康但上一次导航是错误页，则强制重新导航。
+        // 注意不能无条件 loadGame()：url 已经是 LOCAL_URL 时会被守卫拦下，
+        // 且无条件强刷会在每次切回前台时重载游戏、丢掉进度。
         io.execute {
-            if (isServerHealthy()) mainHandler.post { loadGame() }
+            if (isServerHealthy() && lastLoadFailed) mainHandler.post { loadGame(force = true) }
         }
     }
 
-        /**
+    /**
      * 返回键：退出游戏页，回到启动器（而不是直接退出整个 App）。
      * Node 服务是前台服务，会继续在后台跑，再次点「启动游戏」可秒回。
      */
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
+        super.onBackPressed()
         finish()
     }
 
     override fun onDestroy() {
         try { unregisterReceiver(serverReceiver) } catch (_: Exception) {}
+        
+        // 🌟 [修复补丁3]：清空主线程中所有还没执行的延迟任务（比如那个3秒重试），防止诈尸闪退
+        mainHandler.removeCallbacksAndMessages(null)
+        
         io.shutdown()
         super.onDestroy()
     }

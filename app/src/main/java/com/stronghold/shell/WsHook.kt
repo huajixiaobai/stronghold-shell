@@ -55,6 +55,9 @@ object WsHook {
     var TARGET_SCHEME = "$scheme";
     var TARGET_PATH   = "$WS_PATH";
 
+    // 连接序号：给每条 WebSocket 一个稳定 id，原生侧据此记账
+    var sockSeq = 0;
+
     var OrigWS = window.WebSocket;
     if (typeof OrigWS !== 'function') return;
 
@@ -113,10 +116,12 @@ object WsHook {
 
       if (rewritten) {
         var opened = false;
+        // 每条连接一个 id：页面里可能同时开着多条 WS，原生侧按 id 记账才不会误判断开
+        var sockId = 's' + (++sockSeq);
         try {
           ws.addEventListener('open', function () {
             opened = true;
-            notify('LINK_OK');
+            notify('LINK_OK|' + sockId);
           });
           ws.addEventListener('error', function () {
             if (!opened) notifyFail('无法连接服务器 ' + TARGET_HOST);
@@ -125,7 +130,7 @@ object WsHook {
             if (!opened && ev && ev.wasClean === false && ev.code !== 1000) {
               notifyFail('连接被断开 ' + TARGET_HOST + ' 码' + (ev.code || '?'));
             } else if (opened) {
-              notify('LINK_CLOSED code=' + (ev && ev.code));
+              notify('LINK_CLOSED|' + sockId + '|' + (ev && ev.code));
             }
           });
         } catch (e) { /* 事件挂不上不影响主流程 */ }
@@ -156,28 +161,9 @@ object WsHook {
     // 真正挂上之后才置自检标记，原生侧据此判断是否接管成功
     try { window.$HOOK_FLAG = true; } catch (e) {}
 
-    // 屏幕横幅：把「hook 是否生效 / 实际连到哪」直接画出来，
-    // 不依赖 Toast（onPageFinished 可能不触发）也不依赖 logcat（被系统屏蔽）
-    try {
-      var mk = function () {
-        try {
-          if (document.getElementById('__sh_mp_badge')) return;
-          var d = document.createElement('div');
-          d.id = '__sh_mp_badge';
-          d.style.cssText = 'position:fixed;z-index:2147483647;left:8px;bottom:8px;' +
-            'padding:6px 10px;border-radius:6px;font:12px/1.4 monospace;' +
-            'background:rgba(0,229,192,.92);color:#111;pointer-events:none;' +
-            'box-shadow:0 2px 8px rgba(0,0,0,.5);max-width:70vw;word-break:break-all';
-          d.textContent = '联机已接管 → ' + TARGET_HOST;
-          (document.body || document.documentElement).appendChild(d);
-        } catch (e) {}
-      };
-      if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', mk);
-      } else {
-        mk();
-      }
-    } catch (e) {}
+    // 注：这里原本会往页面右下/左下角画一个「联机已接管 → 目标地址」的常驻横幅，
+    // 仅用于早期排查（logcat 被系统屏蔽、Toast 只弹一次）。联机链路稳定后已移除，
+    // 避免长期遮挡游戏 HUD。当前接管状态可看「多人游戏」页，或由原生侧一次性 Toast 提示。
   } catch (e) {
     // 注入失败不阻塞游戏：单机仍然可玩
     try { console.warn('[stronghold] ws hook failed', e); } catch (e2) {}

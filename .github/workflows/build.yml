@@ -64,13 +64,27 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "启动器版本 = $V"
 
+      # ⚠️ 2026-10 起 ubuntu-latest 镜像自带全局 Gradle 已升到 9.x，
+      #    而本项目 AGP 8.5.2 只支持 Gradle 8.x（AGP 用到的 InternalProblems
+      #    内部 API 在 Gradle 9.6 被移除）。原来的写法是直接用全局 gradle 跑
+      #    `gradle wrapper --gradle-version 8.7`，但这条命令会**先配置整个项目**
+      #    （解析 settings.gradle.kts → 加载 AGP），于是在配置阶段就炸了，
+      #    `--gradle-version 8.7` 根本来不及生效。
+      #    改为在临时空目录里生成 wrapper，完全不触碰本项目的构建脚本。
       - name: 生成 Gradle Wrapper（若缺失）
         run: |
           if [ ! -f ./gradlew ]; then
-            echo "==> gradlew 缺失，用全局 gradle 生成 wrapper"
-            gradle wrapper --gradle-version 8.7
+            echo "==> gradlew 缺失，在临时空目录生成 wrapper（避免用 Gradle 9 配置本项目）"
+            TMP=$(mktemp -d)
+            echo 'rootProject.name = "wrapper-gen"' > "$TMP/settings.gradle.kts"
+            ( cd "$TMP" && gradle wrapper --gradle-version 8.7 --distribution-type bin )
+            cp "$TMP/gradlew" "$TMP/gradlew.bat" .
+            mkdir -p gradle/wrapper
+            cp "$TMP/gradle/wrapper/gradle-wrapper.jar" gradle/wrapper/
+            rm -rf "$TMP"
           fi
           chmod +x ./gradlew
+          ./gradlew --version
 
       # ⭐ 固定签名：从 Secrets 还原 keystore，保证每次构建签名的证书一致，
       #    这样后续版本可以「覆盖升级」而不必卸载（不丢已导入的游戏包）。
@@ -143,13 +157,47 @@ jobs:
           path: out/*.apk
           if-no-files-found: error
 
+      # ⚠️ 发布说明里的「本版修复」需要每次发版手动更新：
+      #    版本号不是重点，用户要看的是「这次修了什么问题」。
+      #    写清「修了什么现象 → 为什么会这样 → 现在怎么表现」，别只写"优化体验"。
       - name: 发布到 Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: launcher-v${{ steps.ver.outputs.version }}
+          # ⚠️ 不写这一行，tag 会落在仓库默认分支（main）的最新提交上，
+          #    而不是这次实际构建的分支 —— 表现就是 Release 页的源码链接
+          #    指向 main 的老代码。github.sha 是本次检出到的那个提交。
+          target_commitish: ${{ github.sha }}
           name: 卫戍协议启动器 v${{ steps.ver.outputs.version }}
           body: |
             **《卫戍协议：盟约》安卓启动器** —— 不含游戏内容的空壳，导入上游完整包即可游玩。
+
+            ## 本版修复（v2.0.3）
+
+            **联机提示不再误报、不再刷屏**
+
+            - 之前玩一会儿就来回弹「未连接 / 已连接」，其实连接一直是好的。
+              原因是游戏前端自带自动重连，每次重连都会产生一次断开+连上的事件，
+              旧逻辑逐条弹提示；页面里同时开着多条 WebSocket 时，旧连接正常关闭
+              也会被当成联机断开。
+            - 现在按连接记账，只有全部连接都断了才算掉线；首次连上提示一次，
+              之后的重连全部静默；真的掉线超过 10 秒才提示一次「联机已断开」，
+              恢复后提示一次「已重新连上」。
+            - 提示停留时间由 3.5 秒缩短到 2 秒，不再挡视线。
+            - 移除了游戏画面上常驻的调试横幅，不再遮挡 HUD。
+
+            **服务器地址更好填**
+
+            - 域名不再强制补 `:3000`。挂在 Cloudflare / Nginx 后面的域名只开放
+              80/443，补 3000 会一直连不上。现在：域名默认 80，局域网 IP 默认 3000，
+              显式写的端口优先；端口就是协议默认值时不再显示出来。
+            - 支持 IPv6 地址，例如 `[240c:cb02::1]:3000`。
+            - 支持 `https://` / `wss://` 加密连接，填了 443 端口也会自动走加密。
+
+            **首次启动黑屏**
+
+            - 修复 Node 服务端口还没就绪、WebView 抢跑导致的黑底错误页。
+              现在会退到「正在启动游戏…」并自动重试，正常 3 秒进标题页。
 
             ## 本次包含两个 APK
 

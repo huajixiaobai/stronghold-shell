@@ -1,9 +1,9 @@
 # StrongholdShell 启动器 · 功能清单 / 路线图
 
-> 更新：2026-10-14 ｜ 维护：蓝色大肥鱼 🐟
+> 更新：2026-10-14 ｜ 维护：蓝色大肥鱼 🐟>   
 > 仓库：huajixiaobai/stronghold-shell ｜ 上游游戏本体：sganggs/Stronghold-Protocol
 >
-> 本清单基于**逐文件通读源码**整理（13 个 Kotlin 文件 + manifest + workflow），
+> 本清单基于**逐文件通读源码**整理（13 个 Kotlin 文件 + manifest + workflow），>   
 > 不是凭记忆。状态标记：✅ 已实现 ｜ 🔶 部分/有隐患 ｜ ⬜ 未实现（已有想法） ｜ 💡 灵感（同类 App 借鉴）
 
 ---
@@ -11,72 +11,78 @@
 ## 一、✅ 已实现（跑得通，真机验证过）
 
 ### 1. 核心：把 Node 游戏装进手机
-| # | 功能 | 实现位置 | 说明 |
-|---|---|---|---|
-| 1.1 | **JNA 直调 `libnode.so`** 启动 Node | `NodeRunner.kt` | 调 C++ 符号 `_ZN4node5StartEiPPc`（`node::Start(int,char**)`），免 NDK |
-| 1.2 | **进程内跑 Node** + `chdir` 到 bundle | `NodeRunner.kt` | 用 JNA 调 libc 的 `chdir`（`System.setProperty("user.dir")` 无效） |
-| 1.3 | **前台服务**保活本地服务器 | `NodeService.kt` | `specialUse` 前台服务 + 常驻通知 |
-| 1.4 | **健康检查轮询**（`/healthz`） | `MainActivity.kt` | 180×500ms=90s 上限，健康后加载页面 |
+
+| #   | 功能                               | 实现位置              | 说明                                                              |
+| --- | -------------------------------- | ----------------- | --------------------------------------------------------------- |
+| 1.1 | **JNA 直调 `libnode.so`** 启动 Node  | `NodeRunner.kt`   | 调 C++ 符号 `_ZN4node5StartEiPPc`（`node::Start(int,char**)`），免 NDK |
+| 1.2 | **进程内跑 Node** + `chdir` 到 bundle | `NodeRunner.kt`   | 用 JNA 调 libc 的 `chdir`（`System.setProperty("user.dir")` 无效）     |
+| 1.3 | **前台服务**保活本地服务器                  | `NodeService.kt`  | `specialUse` 前台服务 + 常驻通知                                        |
+| 1.4 | **健康检查轮询**（`/healthz`）           | `MainActivity.kt` | 180×500ms=90s 上限，健康后加载页面                                        |
 
 ### 2. 启动器模式（用户导入游戏包）
-| # | 功能 | 实现位置 | 说明 |
-|---|---|---|---|
-| 2.1 | **导入 zip → 解压到私有目录** | `GamePack.installFromUri` | 流式解压，防目录穿越 |
-| 2.2 | **解压前空间预检** | `GamePack` L92-137 | 双通道估算（已知 size 累加 / 压缩包×3），留 300MB 余量 |
-| 2.3 | **严格校验包完整性** | `GamePack` L176-189 | 缺 `node_modules`/入口 → 导入即报错，不装完再崩 |
-| 2.4 | **探测式定位游戏根** | `GamePack.locateGameRoot` | 兼容「单层 STRONGHOLD-Protocol/ 包裹」及多级嵌套 |
-| 2.5 | **原子替换激活包** | `GamePack` L205-214 | 先解临时目录 → rename 成 `active`，失败降级拷贝 |
-| 2.6 | **包管理界面** | `ImportActivity.kt` | 导入 / 启动 / 删除 / 版本信息 / 日志预览 |
-| 2.7 | **一键开玩**（有包则自动启动） | `ImportActivity` L61-63 | `savedInstanceState==null && hasActivePack` → `launchGame()` |
-| 2.8 | **空间预检友好报错** | `GamePack` + `FileLogger` | 失败原因写日志，UI 取最近一条「导入失败」提示 |
+
+| #   | 功能                   | 实现位置                      | 说明                                                           |
+| --- | -------------------- | ------------------------- | ------------------------------------------------------------ |
+| 2.1 | **导入 zip → 解压到私有目录** | `GamePack.installFromUri` | 流式解压，防目录穿越                                                   |
+| 2.2 | **解压前空间预检**          | `GamePack` L92-137        | 双通道估算（已知 size 累加 / 压缩包×3），留 300MB 余量                         |
+| 2.3 | **严格校验包完整性**         | `GamePack` L176-189       | 缺 `node_modules`/入口 → 导入即报错，不装完再崩                            |
+| 2.4 | **探测式定位游戏根**         | `GamePack.locateGameRoot` | 兼容「单层 STRONGHOLD-Protocol/ 包裹」及多级嵌套                          |
+| 2.5 | **原子替换激活包**          | `GamePack` L205-214       | 先解临时目录 → rename 成 `active`，失败降级拷贝                            |
+| 2.6 | **包管理界面**            | `ImportActivity.kt`       | 导入 / 启动 / 删除 / 版本信息 / 日志预览                                   |
+| 2.7 | **一键开玩**（有包则自动启动）    | `ImportActivity` L61-63   | `savedInstanceState==null && hasActivePack` → `launchGame()` |
+| 2.8 | **空间预检友好报错**         | `GamePack` + `FileLogger` | 失败原因写日志，UI 取最近一条「导入失败」提示                                     |
 
 ### 3. 体验 / 稳定性
-| # | 功能 | 实现位置 | 说明 |
-|---|---|---|---|
-| 3.1 | **首次启动加载页**（替代黑屏） | `MainActivity.showLoadingPage` | 转圈 + 「正在启动游戏…」 |
-| 3.2 | **等待秒数实时刷新** | `MainActivity.updateLoadingPage` | 每 2 秒更新「已等待 N 秒」 |
-| 3.3 | **启动失败兜底 + 自动重试** | `MainActivity.showErrorAndRetry` | 区分「有包但没起来」/「没导入包」两种提示，3 秒后重试 |
-| 3.4 | **自愈**：回前台若服务健康则重新导航 | `MainActivity.onResume` | 防止系统回收后白屏 |
+
+| #   | 功能                   | 实现位置                              | 说明                                 |
+| --- | -------------------- | --------------------------------- | ---------------------------------- |
+| 3.1 | **首次启动加载页**（替代黑屏）    | `MainActivity.showLoadingPage`    | 转圈 + 「正在启动游戏…」                     |
+| 3.2 | **等待秒数实时刷新**         | `MainActivity.updateLoadingPage`  | 每 2 秒更新「已等待 N 秒」                   |
+| 3.3 | **启动失败兜底 + 自动重试**    | `MainActivity.showErrorAndRetry`  | 区分「有包但没起来」/「没导入包」两种提示，3 秒后重试       |
+| 3.4 | **自愈**：回前台若服务健康则重新导航 | `MainActivity.onResume`           | 防止系统回收后白屏                          |
 | 3.5 | **沉浸式全屏**（隐藏状态栏+导航栏） | `MainActivity.setupImmersiveMode` | 滑动临时唤出；`onWindowFocusChanged` 重复隐藏 |
-| 3.6 | **横屏锁定** | `AndroidManifest.xml` | 两个 Activity 都 `sensorLandscape` |
-| 3.7 | **禁长按**（游戏内用不到） | `MainActivity` L129-130 | — |
-| 3.8 | **落盘日志** | `FileLogger.kt` | 用于排错 + UI 展示 |
+| 3.6 | **横屏锁定**             | `AndroidManifest.xml`             | 两个 Activity 都 `sensorLandscape`    |
+| 3.7 | **禁长按**（游戏内用不到）      | `MainActivity` L129-130           | —                                  |
+| 3.8 | **落盘日志**             | `FileLogger.kt`                   | 用于排错 + UI 展示                       |
 
 ### 4. JS ↔ Kotlin 桥（兼容常见打包版前端）
-`AndroidBridge.kt`（注入名 `AndroidNative`）已实现：
-`isNativeApp` / `reportClientState` / `getClientState` / `reloadClient` /
+
+`AndroidBridge.kt`（注入名 `AndroidNative`）已实现：  
+`isNativeApp` / `reportClientState` / `getClientState` / `reloadClient` /  
 `restartLocalServer` / `getLogs` / `getLocalIp` / `exitApp` ✅
 
 ### 5. 构建 / 发布
-| # | 功能 | 实现位置 |
-|---|---|---|
-| 5.1 | **GitHub Actions 云端构建** | `.github/workflows/build.yml` |
-| 5.2 | **正式命名 + SHA-256 + 中文 Release** | workflow L74-119 |
-| 5.3 | **libnode.so 不入库**（构建时下载） | `scripts/fetch_libnode.sh` |
-| 5.4 | **上游版本同步脚本** | `scripts/sync-upstream.sh` |
-| 5.5 | **一键推文件到仓库** | `scripts/push_files.py` |
-| 5.6 | **libc++_shared.so 入库**（关键排错） | `prebuilt/arm64-v8a/libc++_shared.so` |
+
+| #   | 功能                              | 实现位置                                  |
+| --- | ------------------------------- | ------------------------------------- |
+| 5.1 | **GitHub Actions 云端构建**         | `.github/workflows/build.yml`         |
+| 5.2 | **正式命名 + SHA-256 + 中文 Release** | workflow L74-119                      |
+| 5.3 | **libnode.so 不入库**（构建时下载）       | `scripts/fetch_libnode.sh`            |
+| 5.4 | **上游版本同步脚本**                    | `scripts/sync-upstream.sh`            |
+| 5.5 | **一键推文件到仓库**                    | `scripts/push_files.py`               |
+| 5.6 | **libc++\_shared.so 入库**（关键排错）  | `prebuilt/arm64-v8a/libc++_shared.so` |
 
 ---
 
 ## 二、🔶 部分实现 / 有隐患（需打磨）
 
-| # | 问题 | 现状 | 建议 |
-|---|---|---|---|
-| 2.1 | **README 严重过时** | 还写着「14 个文件旧名」「分片 part-00~09」「方式一装现成 APK 含素材」 | 🔥 **优先重写**：对齐现有「启动器模式 + 导入 zip」 |
-| 2.2 | **Node 无法优雅停止** | `stopNode()` 只置标志，实际随进程结束 | 真"重启服务"做不到；`restartLocalServer()` 实为 kill 后新建服务 |
-| 2.3 | **进度条是假的** | `progressBar.progress = (count/500)%100` 循环感，非真实百分比 | 可先用 zip 预扫总条目数，算真实百分比 |
-| 2.4 | **`ExitApp` 只 finish 当前页** | 不真正退进程 | 视需要改 `finishAffinity()` 或 `exitProcess` |
-| 2.5 | **导入无取消入口** | 解压中只能等 | 加「取消」按钮 + 协程可中断 |
-| 2.6 | **多包管理缺失** | 只有 `active` 一个槽，重导入即覆盖 | 见 ⬜3.1 |
-| 2.7 | **启动器版本号写死** | workflow 默认 `1.0.0`，未读 `build.gradle.kts` | 从 gradle 读 versionName |
-| 2.8 | **`.tmp_zip_check` 残留目录** | 仓库根有该临时目录 | 加进 `.gitignore` 并删除 |
+| #   | 问题                         | 现状                                                  | 建议                                              |
+| --- | -------------------------- | --------------------------------------------------- | ----------------------------------------------- |
+| 2.1 | **README 严重过时**            | 还写着「14 个文件旧名」「分片 part-00~09」「方式一装现成 APK 含素材」        | 🔥 **优先重写**：对齐现有「启动器模式 + 导入 zip」                |
+| 2.2 | **Node 无法优雅停止**            | `stopNode()` 只置标志，实际随进程结束                           | 真"重启服务"做不到；`restartLocalServer()` 实为 kill 后新建服务 |
+| 2.3 | **进度条是假的**                 | `progressBar.progress = (count/500)%100` 循环感，非真实百分比 | 可先用 zip 预扫总条目数，算真实百分比                           |
+| 2.4 | **`ExitApp` 只 finish 当前页** | 不真正退进程                                              | 视需要改 `finishAffinity()` 或 `exitProcess`         |
+| 2.5 | **导入无取消入口**                | 解压中只能等                                              | 加「取消」按钮 + 协程可中断                                 |
+| 2.6 | **多包管理缺失**                 | 只有 `active` 一个槽，重导入即覆盖                              | 见 ⬜3.1                                          |
+| 2.7 | **启动器版本号写死**               | workflow 默认 `1.0.0`，未读 `build.gradle.kts`           | 从 gradle 读 versionName                          |
+| 2.8 | **`.tmp_zip_check` 残留目录**  | 仓库根有该临时目录                                           | 加进 `.gitignore` 并删除                             |
 
 ---
 
 ## 三、⬜ 未实现（已有想法，可实装）
 
 ### 3.1 游戏包管理增强
+
 - ⬜ **多包槽位**：保留多个版本，可切换激活（A/B 测试上游新版）
 - ⬜ **导入历史 / 回滚**：记录每次导入版本，一键切回上一版
 - ⬜ **断点续传式导入**？——本质是解压，非下载，**不适用**（排除）
@@ -84,19 +90,23 @@
 - ⬜ **分享已导入包**（局域网）：把 `active` 打包成 zip 供同 Wi-Fi 设备导入
 
 ### 3.2 mod 支持（阶段6，**路线①换 Forge 已定案**）
+
 > 依据：Forge 已在 Node 18.20.4 实测跑通，无卡点。
+
 - ⬜ **接入 Forge 运行时**：启动器识别 Forge 包结构（`workshop-*` 路由）
 - ⬜ **MOD 工坊入口**：前端加载 `/workshop-panels`，手机上装/卸 mod
 - ⬜ **mod 目录约定**：把 mod 放 `filesDir/packs/active/mods/`，避免污染
 - ⬜ **内置 mod 管理器 UI**：列出已装 mod、启停、删除（复用 ImportActivity 风格）
 
 ### 3.3 更新机制
+
 - ⬜ **应用内检查上游新版**：读上游 GitHub Release，提示「有新包可导入」
 - ⬜ **一键下载上游包**（应用内下载 zip → 直接导入），免手动找文件
-   - ⚠️ 注意：下载不涉及素材分发（用户自取），合规
+  - ⚠️ 注意：下载不涉及素材分发（用户自取），合规
 - ⬜ **启动器自身更新检查**（比对本仓库 Release tag）
 
 ### 3.4 体验打磨
+
 - ⬜ **加载页真实进度**（预扫 zip 条目数）
 - ⬜ **首次启动引导**（3 步图示：装包 → 导入 → 开玩）
 - ⬜ **导入失败的错误分级提示**（空间不足 / 缺 node_modules / zip 损坏）
@@ -105,6 +115,7 @@
 - ⬜ **游戏内手势**：边缘滑动呼出系统栏已支持；可加「双击返回」
 
 ### 3.5 健壮性
+
 - ⬜ **崩溃日志自动上报**（本地落盘 + 一键导出）
 - ⬜ **Node 崩溃自动重启**（监听到进程退出 → 重启服务）
 - ⬜ **低内存保护**（监听 `onTrimMemory`，必要时提示释放）
@@ -114,45 +125,49 @@
 
 ## 四、💡 同类 App 借鉴（「从同类调用后的那些」）
 
-> 参考对象：Paper-Yuan 打包版 `com.paper.stronghold`、nodejs-mobile 示例、
+> 参考对象：Paper-Yuan 打包版 `com.paper.stronghold`、nodejs-mobile 示例、>   
 > 各类「网页游戏打包器」（如 WebViewGold / Cordova 思路）
 
-| # | 借鉴点 | 来源 | 我们的现状 | 可做 |
-|---|---|---|---|---|
-| 4.1 | **内置游戏包**（开箱即玩，无需导入） | Paper-Yuan 打包版 | ❌ 我们改成了启动器模式（合规考虑） | 可作为「自用版」可选构建目标 |
-| 4.2 | **`_sim_import` 模拟目录** | 原版解包行为 | ⚠️ 曾污染图库（已清） | 我们**不采用**：正确做法是解压到私有目录 |
-| 4.3 | **客户端状态看门狗**（`reportClientState`） | 原壳 | ✅ 已实现桥，但**未接看门狗逻辑** | 用 `booted` 复位黑屏看门狗 |
-| 4.4 | **`restartLocalServer`** 热重启 | 原壳 | 🔶 部分（无优雅停止） | 配合 3.5 Node 重启做完整 |
-| 4.5 | **局域网房间**（房主/加入） | 上游玩法 | ✅ `getLocalIp` 已备 | 加「显示局域网地址 + 二维码」引导朋友加入 |
-| 4.6 | **多语言界面** | 常见打包器 | ❌ 硬编码中文 | 抽 strings.xml，加英文 |
-| 4.7 | **主题色可换** | WebViewGold | ❌ 硬编码 | 低成本加分项 |
-| 4.8 | **文件选择器 SAF 兼容** | 现代打包器 | ✅ 已用 `ACTION_OPEN_DOCUMENT` | 已完成 |
-| 4.9 | **下载进度条** | Cordova 类 | ❌ 无下载功能 | 配合 3.3 应用内下载 |
-| 4.10 | **启动器不含素材**（合规分离） | 我们独创 | ✅ 已实现 | 这是我们的**差异化优势**，坚持 |
+| #    | 借鉴点                               | 来源             | 我们的现状                       | 可做                     |
+| ---- | --------------------------------- | -------------- | --------------------------- | ---------------------- |
+| 4.1  | **内置游戏包**（开箱即玩，无需导入）              | Paper-Yuan 打包版 | ❌ 我们改成了启动器模式（合规考虑）          | 可作为「自用版」可选构建目标         |
+| 4.2  | **`_sim_import` 模拟目录**            | 原版解包行为         | ⚠️ 曾污染图库（已清）                | 我们**不采用**：正确做法是解压到私有目录 |
+| 4.3  | **客户端状态看门狗**（`reportClientState`） | 原壳             | ✅ 已实现桥，但**未接看门狗逻辑**         | 用 `booted` 复位黑屏看门狗     |
+| 4.4  | **`restartLocalServer`** 热重启      | 原壳             | 🔶 部分（无优雅停止）                | 配合 3.5 Node 重启做完整      |
+| 4.5  | **局域网房间**（房主/加入）                  | 上游玩法           | ✅ `getLocalIp` 已备           | 加「显示局域网地址 + 二维码」引导朋友加入 |
+| 4.6  | **多语言界面**                         | 常见打包器          | ❌ 硬编码中文                     | 抽 strings.xml，加英文      |
+| 4.7  | **主题色可换**                         | WebViewGold    | ❌ 硬编码                       | 低成本加分项                 |
+| 4.8  | **文件选择器 SAF 兼容**                  | 现代打包器          | ✅ 已用 `ACTION_OPEN_DOCUMENT` | 已完成                    |
+| 4.9  | **下载进度条**                         | Cordova 类      | ❌ 无下载功能                     | 配合 3.3 应用内下载           |
+| 4.10 | **启动器不含素材**（合规分离）                 | 我们独创           | ✅ 已实现                       | 这是我们的**差异化优势**，坚持      |
 
 ---
 
 ## 五、优先级建议（我的排序）
 
 ### P0（立刻做，成本低收益高）
+
 1. **重写 README**（现在严重误导，还写分片/含素材）
 2. **修 workflow 版本号**（从 gradle 读，别写死 1.0.0）
 3. **清 `.tmp_zip_check`** + 更新 `.gitignore`
 
 ### P1（近期，价值明显）
-4. **阶段6：接入 Forge + mod 支持**（路线已定案，实测通过）
-5. **应用内检查/下载上游新版**（免手动找 zip）
-6. **导入进度真实化**（预扫条目）
+
+1. **阶段6：接入 Forge + mod 支持**（路线已定案，实测通过）
+2. **应用内检查/下载上游新版**（免手动找 zip）
+3. **导入进度真实化**（预扫条目）
 
 ### P2（体验打磨）
-7. 首次启动引导
-8. 错误分级提示
-9. 多包槽位 / 回滚
+
+1. 首次启动引导
+2. 错误分级提示
+3. 多包槽位 / 回滚
 
 ### P3（锦上添花）
-10. 崩溃自动重启
-11. 局域网分享 / 二维码
-12. 主题 / 多语言
+
+1. 崩溃自动重启
+2. 局域网分享 / 二维码
+3. 主题 / 多语言
 
 ---
 
@@ -165,4 +180,4 @@
 
 ---
 
-_本清单随项目推进持续更新。有想法直接说，我加进来。_ 🐟
+*本清单随项目推进持续更新。有想法直接说，我加进来。* 🐟
