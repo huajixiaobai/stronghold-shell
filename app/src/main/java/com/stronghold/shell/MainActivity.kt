@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
@@ -53,6 +54,10 @@ class MainActivity : AppCompatActivity() {
     /** 联机自检是否已执行过（onPageFinished 会多次触发，只弹一次提示） */
     private var hookCheckDone = false
 
+    /** 游戏页面是否已经真正加载过（防止重复 loadUrl / 加载页覆盖游戏） */
+    @Volatile
+    private var gameLoaded = false
+
     companion object {
         private const val TAG = "StrongholdShell"
         const val LOCAL_URL = "http://127.0.0.1:3000"
@@ -73,12 +78,15 @@ class MainActivity : AppCompatActivity() {
         private const val INDEX_PATH = "/index.html"
     }
 
-    /** 服务状态广播接收器：服务就绪后加载页面 */
+    /** 服务状态广播接收器：只记录状态，加载由健康检查统一决定 */
     private val serverReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val ready = intent?.getBooleanExtra(EXTRA_SERVER_READY, false) ?: false
             Log.i(TAG, "收到服务状态广播: ready=$ready")
-            if (ready) loadGame()
+            // 注意：这个 ready=true 只代表「Node 线程已启动」，并不代表 HTTP 已经能响应。
+            // 之前在这里直接 loadGame()，会抢在服务真正就绪前加载，造成首屏黑屏/卡住；
+            // 返回再进时服务早就好了，所以才会「秒进」。
+            // 现在统一交给 pollHealthAndLoad() 用真实 HTTP 探测决定，这里不再触发加载。
         }
     }
 
@@ -120,12 +128,10 @@ class MainActivity : AppCompatActivity() {
         // 5) 轮询健康检查（服务可能比 UI 慢）
         pollHealthAndLoad()
 
-        // 6) 联机自检兜底：onPageFinished 不一定会触发（重定向/缓存命中时会被跳过），
-        //    所以改用固定延时轮询，确保诊断一定跑起来
-        if (serverAddress != null) {
-            mainHandler.postDelayed({ runHookSelfCheck() }, 6000)
-            mainHandler.postDelayed({ runHookSelfCheck() }, 15000)
-        }
+        // 注意：联机自检不在这里计时。
+        // 首次启动 Node 可能要几十秒，那时 WebView 还停在加载页，
+        // 此时自检必然读不到 hook 标志，会误报「联机未生效」并消耗掉唯一的一次提示机会。
+        // 自检统一改到 loadGame() 真正发起页面加载之后才开始计时。
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -343,28 +349,45 @@ class MainActivity : AppCompatActivity() {
      *   - installed=false → 红色Toast，说清 hook 没进去
      *   - 异常            → 红色Toast，说清 JS 桥没通
      */
-    private fun runHookSelfCheck() {
+    private fun runHookSelfCheck(isFinal: Boolean = true) {
         if (isFinishing || isDestroyed) return
         val js = "(function(){try{return String(window." + WsHook.HOOK_FLAG + "===true);}catch(e){return 'ERR:'+e.message;}})()"
         webView.evaluateJavascript(js) { raw ->
             val v = raw?.trim()?.trim('"') ?: "null"
             mainHandler.post {
                 if (isFinishing || isDestroyed) return@post
-                // 结果同步画到页面上（Toast 只弹一次，屏幕上持续可见）
+                // 第 3 秒那次可能页面还没解析完，hook 标志天然读不到。
+                // 非最终轮如果读不到，先什么都不做，等第 10 秒那次再下结论，
+                // 免得用户刚进游戏就看到一片红字。
+                if (!isFinal && v != "true") return@post
+                // 只保留「未生效」这种异常状态的常驻显示；
+                // 接管成功属于正常情况，横幅展示几秒即可自动消失，不遮挡游戏画面。
                 val msg = when {
                     v == "true" -> "联机已接管 → ${serverName ?: serverAddress}"
                     v == "false" -> "联机未生效（仍是单机）"
                     else -> "自检异常：$v"
                 }
+                val keepOnScreen = v != "true"   // 异常才常驻，成功则自动淡出
+                // 正常=绿色；未生效/自检异常=红色，否则报错却显示绿色会误导用户
+                val color = if (keepOnScreen) "#ff5252" else "#0f0"
                 webView.evaluateJavascript(
                     "(function(){try{var d=document.getElementById('__sh_diag');" +
                         "if(!d){d=document.createElement('div');d.id='__sh_diag';" +
                         "d.style.cssText='position:fixed;z-index:2147483647;left:8px;top:8px;" +
                         "padding:6px 10px;border-radius:6px;font:12px/1.4 monospace;" +
                         "background:rgba(0,0,0,.85);color:#0f0;pointer-events:none;" +
-                        "box-shadow:0 2px 8px rgba(0,0,0,.5)';" +
+                        "box-shadow:0 2px 8px rgba(0,0,0,.5);transition:opacity .5s ease';" +
                         "(document.body||document.documentElement).appendChild(d);}" +
-                        "d.textContent=${jsLiteralForJs(msg)};}catch(e){}})()",
+                        // 自检会跑两次（3s / 10s），先清掉上一轮的定时器，
+                        // 否则旧定时器会把新横幅提前淡出或误删。
+                        "if(d.__shTimer){clearTimeout(d.__shTimer);d.__shTimer=null;}" +
+                        "if(d.__shRmTimer){clearTimeout(d.__shRmTimer);d.__shRmTimer=null;}" +
+                        "d.style.color='$color';d.style.opacity='1';" +
+                        "d.textContent=${jsLiteralForJs(msg)};" +
+                        "if(!$keepOnScreen){d.__shTimer=setTimeout(function(){try{d.style.opacity='0';" +
+                        "d.__shRmTimer=setTimeout(function(){try{if(d.parentNode)d.parentNode.removeChild(d);}catch(e2){}},600);" +
+                        "}catch(e1){}},3000);}" +
+                        "}catch(e){}})()",
                     null
                 )
                 if (!hookCheckDone) {
@@ -385,6 +408,9 @@ class MainActivity : AppCompatActivity() {
                 '\n' -> sb.append("\\n")
                 '\r' -> sb.append("\\r")
                 '<' -> sb.append("\\x3c")
+                // JS 里 \u2028 / \u2029 是行终止符，不转义会直接报 SyntaxError
+                '\u2028' -> sb.append("\\u2028")
+                '\u2029' -> sb.append("\\u2029")
                 else -> sb.append(c)
             }
         }
@@ -452,17 +478,39 @@ class MainActivity : AppCompatActivity() {
      */
     private fun pollHealthAndLoad() {
         showLoadingPage()
+        // 每 2 秒刷新一次提示（由主线程定时器驱动，不占 IO 线程）
+        val ticker = object : Runnable {
+            var sec = 0
+            override fun run() {
+                if (isFinishing || isDestroyed) return
+                if (gameLoaded) return
+                sec += 2
+                updateLoadingPage(sec)
+                mainHandler.postDelayed(this, 2000)
+            }
+        }
+        mainHandler.postDelayed(ticker, 2000)
+
         io.execute {
             var ok = false
-            val maxTries = 180          // 180 × 500ms = 90 秒
-            for (i in 1..maxTries) {
-                if (isServerHealthy()) { ok = true; break }
-                if (i % 4 == 0) {       // 每 2 秒刷新一次提示
-                    val sec = i / 2
-                    mainHandler.post { updateLoadingPage(sec) }
+            // 用时间戳做截止，避免单次探测耗时 5 秒导致总等待被放大到十几分钟
+            val deadline = SystemClock.elapsedRealtime() + 90_000L
+            while (SystemClock.elapsedRealtime() < deadline) {
+                // Activity 已销毁 / 游戏已加载就立刻退出，避免后台空转并长期持有 Activity
+                if (isFinishing || isDestroyed || gameLoaded) {
+                    mainHandler.removeCallbacks(ticker)
+                    return@execute
                 }
-                Thread.sleep(500)
+                if (isServerHealthy()) { ok = true; break }
+                try {
+                    Thread.sleep(500)
+                } catch (_: InterruptedException) {
+                    mainHandler.removeCallbacks(ticker)
+                    return@execute
+                }
             }
+            mainHandler.removeCallbacks(ticker)
+            if (isFinishing || isDestroyed) return@execute
             Log.i(TAG, "健康检查结果: $ok")
             if (ok) mainHandler.post { loadGame() }
             else mainHandler.post { showErrorAndRetry() }
@@ -510,9 +558,12 @@ class MainActivity : AppCompatActivity() {
     private fun isServerHealthy(): Boolean {
         return try {
             val conn = URL(HEALTH_URL).openConnection() as HttpURLConnection
-            conn.connectTimeout = 1500
-            conn.readTimeout = 1500
+            // Node 首次启动要加载 2 万多个站点文件，CPU 打满时连本机也会慢；
+            // 1.5 秒太急会误判「未就绪」，从而白等满 90 秒。放宽到 5 秒。
+            conn.connectTimeout = 5000
+            conn.readTimeout = 5000
             conn.requestMethod = "GET"
+            conn.setRequestProperty("Connection", "close")
             val code = conn.responseCode
             conn.disconnect()
             code in 200..299
@@ -522,16 +573,34 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadGame() {
-        if (webView.url?.startsWith(LOCAL_URL) == true) return
+        // 已经加载过游戏主页面就不再重复 loadUrl。
+        // 旧逻辑用 webView.url 判断，但加载页（loadDataWithBaseURL，url=null）和
+        // 中间态都会让它误判，导致重复加载、把已经跑起来的游戏顶掉。
+        if (isFinishing || isDestroyed) return
+        if (gameLoaded) return
+        if (webView.url?.startsWith(LOCAL_URL) == true && !webView.url.orEmpty().contains("about:blank")) {
+            gameLoaded = true
+            return
+        }
+        gameLoaded = true
         // 联机模式下加一个查询串，确保 URL 唯一、绕开 WebView 缓存，
         // 保证 shouldInterceptRequest 一定被调用（否则 hook 注不进去）
         val suffix = if (serverAddress != null) "?multiplayer=1" else ""
         Log.i(TAG, "加载游戏页面: $LOCAL_URL/index.html$suffix")
         webView.loadUrl("$LOCAL_URL/index.html$suffix")
+
+        // 联机自检：必须在真正开始加载游戏页面之后才计时。
+        // 放在 onCreate 里会在还停在加载页时就去问 hook 标志，必然误报「未生效」。
+        if (serverAddress != null) {
+            mainHandler.postDelayed({ runHookSelfCheck(isFinal = false) }, 3000)
+            mainHandler.postDelayed({ runHookSelfCheck(isFinal = true) }, 10000)
+        }
     }
 
     /** 服务没起来时的兜底提示（黑屏看门狗思路：不崩，只提示 + 重试） */
     private fun showErrorAndRetry() {
+        // 生命周期守卫：投递到主线程时 Activity 可能正在销毁
+        if (isFinishing || isDestroyed) return
         // 区分两种情形，给用户明确指引：
         //   ① 有导入包但 Node 没起来 → 多半是首次启动还没加载完 / 被系统回收
         //   ② 压根没导入包 → 提示先去导入
@@ -577,8 +646,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        // 清掉所有挂起的 Runnable（加载页 ticker、联机自检 3s/10s 等），
+        // 否则 Handler 会持有已销毁的 Activity 直到延时结束，造成内存泄漏。
+        mainHandler.removeCallbacksAndMessages(null)
+        io.shutdownNow()
         try { unregisterReceiver(serverReceiver) } catch (_: Exception) {}
-        io.shutdown()
         super.onDestroy()
     }
 }
