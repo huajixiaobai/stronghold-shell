@@ -8,6 +8,8 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- 应用内更新：下载新版本 APK 后要拉起系统安装器（Android 8+ 需用户授权） -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- 读外部存储的 zip：仅 Android 12 及以下需要（13+ 用 SAF，无需权限） -->
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
@@ -48,7 +50,7 @@
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:screenOrientation="sensorLandscape" />
-        <!-- 多人游戏服务器列表（仅 lab 版从界面进入；主版本不暴露入口） -->
+        <!-- 多人游戏服务器列表（2.1.0 起合并进正式版，入口常驻） -->
         <activity
             android:name=".MultiplayerActivity"
             android:exported="false"

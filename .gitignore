@@ -24,6 +24,7 @@ app/src/main/jniLibs/**/*.so
 *.jks
 *.keystore
 app/stronghold.jks
+signing.properties
 
 # 临时 / 中间产物（绝不提交）
 .tmp_zip_check/

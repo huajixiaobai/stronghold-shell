@@ -156,7 +156,7 @@ object ServerStore {
      *   "example.com"                → example.com:80           （域名缺省 80，走 ws）
      *   "https://example.com"        → example.com:443          （tls=true，走 wss）
      *   "www.example.com:3000"       → www.example.com:3000
-     *   "http://[240c::1]:3000/"     → [240c::1]:3000
+     *   "http://[2001:db8::1]:3000/" → [2001:db8::1]:3000
      *
      * 为什么域名默认 80 而不是 3000：挂在 Cloudflare / Nginx 后面的域名只开放
      * 80/443，3000 这类端口根本不通（Cloudflare 只代理标准端口）。局域网直连
@@ -182,7 +182,7 @@ object ServerStore {
         s = s.trim()
         if (s.isEmpty()) return Result(null, "地址无效")
 
-        // ---- IPv6 字面量：[240c:cb02::1]:3000 / [240c:cb02::1] ----
+        // ---- IPv6 字面量：[2001:db8::1]:3000 / [2001:db8::1] ----
         // 必须放在通用 host:port 拆分之前：IPv6 冒号太多，
         // lastIndexOf(':') 会把地址的最后一段当成端口切错。
         if (s.startsWith("[")) {
@@ -203,8 +203,8 @@ object ServerStore {
             return Result(fmt("[$inner]", portNum, tls), null, tls)
         }
         // 没加方括号、但整串本身就是一个合法 IPv6（未指定端口）→ 用默认端口
-        // 注意：这种写法无法再附加端口（"240c:cb02::1:3000" 里的 3000 是合法的 hex 段），
-        // 要指定端口请写成 [240c:cb02::1]:3000
+        // 注意：这种写法无法再附加端口（"2001:db8::1:3000" 里的 3000 是合法的 hex 段），
+        // 要指定端口请写成 [2001:db8::1]:3000
         if (s.count { it == ':' } >= 2 && IPV6.matches(s)) {
             val p = (schemePort ?: "3000").toIntOrNull() ?: return Result(null, "端口号必须是数字")
             return Result(fmt("[$s]", p, tls), null, tls)
