@@ -48,6 +48,20 @@ class MainActivity : AppCompatActivity() {
     private var serverAddress: String? = null
     /** 联机模式：服务器显示名，仅用于提示 */
     private var serverName: String? = null
+    /** 联机模式：服务器是否走加密连接（wss） */
+    private var serverTls: Boolean = false
+    /**
+     * 当前处于「已连接」状态的 WebSocket 集合。
+     *
+     * 为什么要按 id 记：游戏在同一页面里可能同时开着多条 WS（大厅一条、房间一条），
+     * 旧的那条正常关闭时并不代表联机断了。只按「有没有收到过 close」判断会误报，
+     * 用户就会看到「未连接 / 已连接」来回弹 —— 实际上连接一直是好的。
+     */
+    private val openSockets = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    /** 「已联机」成功提示只弹一次，之后的重连一律静默 */
+    private var onlineAnnounced = false
+    /** 「联机已断开」提示是否已弹过，避免掉线期间反复刷屏 */
+    private var offlineAnnounced = false
     /** 已注入过 hook 的页面 URL，避免重复插入 */
     private val hookedUrls = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
@@ -73,7 +87,8 @@ class MainActivity : AppCompatActivity() {
         const val EXTRA_SERVER_ADDRESS = "server_address"
         /** 联机模式下用于界面提示的服务器名 */
         const val EXTRA_SERVER_NAME = "server_name"
-
+        /** 该服务器是否走加密连接（wss / https），由 ServerStore 规范化时判定 */
+        const val EXTRA_SERVER_TLS = "server_tls"
         /** 需要注入 hook 的入口页面（唯一一个会插入脚本的路径） */
         private const val INDEX_PATH = "/index.html"
     }
@@ -96,7 +111,12 @@ class MainActivity : AppCompatActivity() {
         // 0) 读取联机参数。有地址 = 联机模式，无地址 = 单机（行为完全不变）
         serverAddress = intent.getStringExtra(EXTRA_SERVER_ADDRESS)?.takeIf { it.isNotBlank() }
         serverName = intent.getStringExtra(EXTRA_SERVER_NAME)
+        serverTls = intent.getBooleanExtra(EXTRA_SERVER_TLS, false)
         Log.i(TAG, "启动模式: " + if (serverAddress == null) "单机" else "联机 -> $serverAddress")
+        hookedUrls.clear()
+        openSockets.clear()
+        onlineAnnounced = false
+        offlineAnnounced = false
 
         // 1) 仅在「没有导入游戏包」时，才回退解压 assets 内置资源
         //    （启动器模式：用户导入的包在 GamePack.activeDir，不需要这步）
