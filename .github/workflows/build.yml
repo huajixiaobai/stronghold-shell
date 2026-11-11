@@ -146,7 +146,7 @@ jobs:
       - name: 校验签名证书指纹
         run: |
           AS="${ANDROID_HOME}/build-tools/34.0.0/apksigner"
-          EXPECT="6b825bc9f5ef05ab1ec545f9872d6fa0e6301b653760f3937896fbcd21a53c71"
+          EXPECT="d55a0a40283b317018c200971e3af22bcecbfdd7485e54422e27003178869df3"
           for f in out/*.apk; do
             GOT=$("$AS" verify --print-certs "$f" | grep -m1 "certificate SHA-256 digest" | awk '{print $NF}')
             echo "$f -> $GOT"
