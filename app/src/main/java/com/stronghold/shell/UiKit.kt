@@ -274,35 +274,46 @@ object UiKit {
             layoutParams = LinearLayout.LayoutParams(dp(context, dp), 1)
         }
 
-    /** 进度条（细横条，荧光绿） */
-    fun progressBar(context: Context, heightDp: Float = 6f): View {
-        return object : View(context) {
-            var progress: Float = 0f
-                set(value) {
-                    field = value.coerceIn(0f, 1f)
-                    invalidate()
-                }
-            private val p = Paint(Paint.ANTI_ALIAS_FLAG)
-
-            override fun onDraw(canvas: Canvas) {
-                super.onDraw(canvas)
-                val h = this.height.toFloat()
-                p.color = 0xFF2F3236.toInt()
-                canvas.drawRect(0f, 0f, width.toFloat(), h, p)
-                p.color = ACCENT
-                canvas.drawRect(0f, 0f, width * progress, h, p)
-                if (progress > 0.02f) {
-                    p.color = 0xFFFFFFFF.toInt()
-                    val x = width * progress
-                    canvas.drawRect(x - dp(context, 2f), 0f, x, h, p)
-                }
+    /**
+     * 细横条进度条（荧光绿）。
+     *
+     * 抽成具名类而不是匿名 View：调用方要能直接 `bar.progress = 0.42f`。
+     * 匿名类的话外部拿不到这个属性，之前下载代码里只能用反射去调 setProgress，
+     * 又慢又容易在混淆后失效。
+     */
+    class ThinProgressBar(context: Context, heightDp: Float) : View(context) {
+        var progress: Float = 0f
+            set(value) {
+                field = value.coerceIn(0f, 1f)
+                invalidate()
             }
-        }.apply {
+
+        private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+        init {
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(context, heightDp)
+                ViewGroup.LayoutParams.MATCH_PARENT, UiKit.dp(context, heightDp)
             )
         }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val h = this.height.toFloat()
+            p.color = 0xFF2F3236.toInt()
+            canvas.drawRect(0f, 0f, width.toFloat(), h, p)
+            p.color = ACCENT
+            canvas.drawRect(0f, 0f, width * progress, h, p)
+            if (progress > 0.02f) {
+                p.color = 0xFFFFFFFF.toInt()
+                val x = width * progress
+                canvas.drawRect(x - UiKit.dp(context, 2f), 0f, x, h, p)
+            }
+        }
     }
+
+    /** 进度条（细横条，荧光绿） */
+    fun progressBar(context: Context, heightDp: Float = 6f): ThinProgressBar =
+        ThinProgressBar(context, heightDp)
 
     /** 标签 chip（如 "0.3.1" "UPSTREAM"） */
     fun chip(context: Context, text: String, color: Int = ACCENT): TextView {
