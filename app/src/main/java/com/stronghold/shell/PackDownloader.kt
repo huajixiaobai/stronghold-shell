@@ -105,15 +105,29 @@ object PackDownloader {
     /**
      * 下载通道列表。空前缀 = 直接用官方 URL。
      *
-     * 说明：release 的官方 URL 会 302 跳到 objects.githubusercontent.com，
-     * 这个直链是最原始、最不依赖第三方的路径，必须保留。
+     * 【顺序说明】前 4 项与桌面启动器 updater.cjs 的 mirrors 数组**完全一致**：
+     *   githubproxy.cc → gh-proxy.com → moeyy.cn/gh-proxy → 官方直连（兜底）
+     * 桌面端实测这套顺序可用，所以这里直接沿用，并把官方直连从原来的第一位
+     * 挪到第三位之后 —— 国内环境下直连经常超时，放最前面只会白白拖时间。
+     *
+     * 后面 3 项是壳原有的备选，保留作为额外兜底（顺序靠后，不影响首选）。
+     *
+     * 【什么时候会用到这个顺序】
+     *   1. SteppedUpdater 逐级升级：不走测速，直接按本表顺序试 —— 第一项就是 githubproxy.cc
+     *   2. 用户在「选择下载通道」里点「不测速，直接下」→ PackDownloader.allAsIs()
+     *   3. 测速全部失败时的兜底轮转
+     * 若走了测速（probeAll），结果会按**实测速度**重排，本顺序只作为同速时的参考。
      */
     val MIRRORS = listOf(
-        "" to "GitHub 原版直连",
-        "https://gh.monlor.com/" to "gh.monlor.com",
+        // ---- 与桌面端一致的 4 项，顺序不要随意调 ----
+        "https://githubproxy.cc/" to "githubproxy.cc",
         "https://gh-proxy.com/" to "gh-proxy.com",
+        "https://moeyy.cn/gh-proxy/" to "moeyy.cn/gh-proxy",
+        "" to "GitHub 原版直连",
+        // ---- 壳原有备选，仅作兜底 ----
         "https://ghproxy.net/" to "ghproxy.net",
-        "https://ghfast.top/" to "ghfast.top"
+        "https://ghfast.top/" to "ghfast.top",
+        "https://gh.monlor.com/" to "gh.monlor.com"
     )
 
     /** 单个通道的探测结果 */

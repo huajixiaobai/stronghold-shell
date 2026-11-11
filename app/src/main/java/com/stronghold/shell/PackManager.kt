@@ -30,6 +30,7 @@ object PackManager {
     private const val TAG = "StrongholdShell"
     private const val INDEX_FILE = "installed.json"
     private const val LEGACY_ACTIVE = "active"
+    private const val TRASH_DIR = ".trash"
 
     /** 一个已安装版本 */
     data class PackEntry(
@@ -234,7 +235,82 @@ object PackManager {
         val root = packsRoot(context)
         val dir = File(root, id)
         val ok = dir.deleteRecursively()
+        dropIndexEntry(context, id)
+        return ok
+    }
 
+    // ==================== 回收站（删除后 10 秒内可撤销） ====================
+
+    /**
+     * 【为什么这么做】一个包 800MB 左右，删掉只能重下，而 `deleteRecursively()`
+     * 是不可逆的。误触一次代价太大，所以在「真删」之前留一个 10 秒的后悔窗口。
+     *
+     * 实现上没有做完整的回收站页面，只借用同一分区 `rename` 的原子性：
+     *   删除 → packs/v0.3.2 改名为 packs/.trash/v0.3.2@<时间戳>（瞬间，不复制）
+     *   撤销 → 改回原名，索引条目原样复活
+     *   超时 → 才真正 deleteRecursively()
+     *
+     * 【为什么不碰索引】`listPacks()` 本来就会跳过「目录不存在」的条目，
+     *   所以目录一挪走，列表里自然就看不见了；挪回来又自动出现。
+     *   整个过程不读写 installed.json，也就没有把索引写坏的风险。
+     */
+    fun trashRoot(context: Context): File {
+        val d = File(packsRoot(context), TRASH_DIR)
+        if (!d.exists()) d.mkdirs()
+        return d
+    }
+
+    /** 把版本目录挪进回收站（不动索引）。返回挪过去的目录，失败返回 null。 */
+    fun trashPack(context: Context, id: String): File? {
+        val src = File(packsRoot(context), id)
+        if (!src.isDirectory) return null
+        val dest = File(trashRoot(context), "$id@${System.currentTimeMillis()}")
+        if (src.renameTo(dest)) {
+            Log.i(TAG, "移入回收站：$id -> ${dest.name}")
+            return dest
+        }
+        // 极少数 ROM 上跨挂载点 rename 会失败，退回直接删除，别让用户卡住
+        Log.w(TAG, "移入回收站失败，直接删除：$id")
+        src.deleteRecursively()
+        dropIndexEntry(context, id)
+        return null
+    }
+
+    /** 从回收站恢复（10 秒窗口内调用） */
+    fun restorePack(context: Context, trashed: File): Boolean {
+        val id = trashed.name.substringBefore('@')
+        val dest = File(packsRoot(context), id)
+        if (dest.exists()) return false
+        val ok = trashed.renameTo(dest)
+        if (ok) Log.i(TAG, "已从回收站恢复：$id")
+        return ok
+    }
+
+    /** 撤销窗口结束，真正删除并摘掉索引条目 */
+    fun commitTrash(context: Context, trashed: File) {
+        val id = trashed.name.substringBefore('@')
+        val ok = trashed.deleteRecursively()
+        dropIndexEntry(context, id)
+        Log.i(TAG, "回收站结算：$id (删除${if (ok) "成功" else "失败"})")
+    }
+
+    /**
+     * 启动时清理残留 —— App 在 10 秒窗口内被杀掉时，.trash 里会留下目录，
+     * 索引里也还留着条目。这里统一结算掉，避免越攒越多。
+     *
+     * @return 清理的条目数
+     */
+    fun sweepTrash(context: Context): Int {
+        val dir = File(packsRoot(context), TRASH_DIR)
+        if (!dir.isDirectory) return 0
+        val list = dir.listFiles() ?: return 0
+        for (f in list) commitTrash(context, f)
+        if (list.isNotEmpty()) Log.i(TAG, "启动清理回收站 ${list.size} 项")
+        return list.size
+    }
+
+    /** 从索引里摘掉一条，必要时把 activeId 指向剩下的第一个 */
+    private fun dropIndexEntry(context: Context, id: String) {
         val idx = readIndex(context)
         val arr = idx.optJSONArray("packs") ?: JSONArray()
         val newArr = JSONArray()
@@ -249,7 +325,6 @@ object PackManager {
             idx.put("activeId", first)
         }
         writeIndex(context, idx)
-        return ok
     }
 
     // ==================== 工具 ====================

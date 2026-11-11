@@ -25,6 +25,15 @@ object ZipInstaller {
     private const val TAG = "StrongholdShell"
 
     /**
+     * 进度回调的最小间隔（已解压字节数）。
+     *
+     * 【为什么按字节而不是按文件数】原来是每 50 个文件回调一次。游戏包里有
+     * libnode.so 这种 60MB 的单个大文件，中间一次都不回调 —— 进度条会卡住
+     * 十几秒不动，看起来像死机。改成按字节后，大文件也能持续上报。
+     */
+    private const val REPORT_STEP = 4L * 1024 * 1024
+
+    /**
      * 从 content Uri 解压（用户通过文件选择器选的 zip）。
      *
      * @param onProgress (已解压条目数, 已解压字节) → 在调用线程回调
@@ -40,6 +49,7 @@ object ZipInstaller {
         val destPath = destDir.canonicalPath
         var count = 0
         var bytes = 0L
+        var lastReport = 0L
 
         context.contentResolver.openInputStream(uri)?.use { ins ->
             ZipInputStream(ins.buffered()).use { zis ->
@@ -58,10 +68,13 @@ object ZipInstaller {
                                     if (n <= 0) break
                                     os.write(buf, 0, n)
                                     bytes += n
+                                    if (bytes - lastReport >= REPORT_STEP) {
+                                        lastReport = bytes
+                                        onProgress?.invoke(count, bytes)
+                                    }
                                 }
                             }
                             count++
-                            if (count % 50 == 0) onProgress?.invoke(count, bytes)
                         } else {
                             Log.w(TAG, "跳过可疑路径（疑似穿越）：$name")
                             FileLogger.log("跳过可疑路径：$name")
@@ -90,6 +103,7 @@ object ZipInstaller {
         val destPath = destDir.canonicalPath
         var count = 0
         var bytes = 0L
+        var lastReport = 0L
 
         FileInputStream(zip).use { ins ->
             ZipInputStream(ins.buffered()).use { zis ->
@@ -107,10 +121,13 @@ object ZipInstaller {
                                     if (n <= 0) break
                                     os.write(buf, 0, n)
                                     bytes += n
+                                    if (bytes - lastReport >= REPORT_STEP) {
+                                        lastReport = bytes
+                                        onProgress?.invoke(count, bytes)
+                                    }
                                 }
                             }
                             count++
-                            if (count % 50 == 0) onProgress?.invoke(count, bytes)
                         } else {
                             Log.w(TAG, "跳过可疑路径（疑似穿越）：$name")
                             FileLogger.log("跳过可疑路径：$name")

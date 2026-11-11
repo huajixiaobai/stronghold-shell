@@ -260,7 +260,8 @@ class MultiplayerActivity : AppCompatActivity() {
                     id = existing?.id ?: UUID.randomUUID().toString(),
                     name = rawName,
                     address = res.address,
-                    lastPlayed = existing?.lastPlayed ?: 0L
+                    lastPlayed = existing?.lastPlayed ?: 0L,
+                    tls = res.tls
                 )
                 ServerStore.upsert(this, entry)
                 dialog.dismiss()
@@ -286,6 +287,7 @@ class MultiplayerActivity : AppCompatActivity() {
             Intent(this, MainActivity::class.java).apply {
                 putExtra(MainActivity.EXTRA_SERVER_ADDRESS, s.address)
                 putExtra(MainActivity.EXTRA_SERVER_NAME, s.displayName)
+                putExtra(MainActivity.EXTRA_SERVER_TLS, s.tls)
             }
         )
     }

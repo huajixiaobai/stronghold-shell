@@ -3,8 +3,8 @@ name: Build APK
 on:
   workflow_dispatch:            # 手动触发
     inputs:
-      version:                  # 可选：指定上游版本号（不填则自动查最新）
-        description: '上游版本号，如 0.2.5（留空=自动取最新）'
+      version:                  # 可选：指定启动器版本号（只影响 tag 与产物名）
+        description: '启动器版本号，如 2.1.0（留空=自动读 build.gradle.kts）'
         required: false
         default: ''
   push:
@@ -52,10 +52,10 @@ jobs:
       - name: 版本号（启动器版本）
         id: ver
         run: |
-          # 手动触发时以输入为准；否则从 app/build.gradle.kts 读 stable 变体的 versionName
+          # 手动触发时以输入为准；否则从 app/build.gradle.kts 读 versionName
           V="${{ github.event.inputs.version }}"
           if [ -z "$V" ]; then
-            # productFlavors 里有两个 versionName，取第一个（stable 的 2.0.1）
+            # 2.1.0 起只有一个变体，直接取第一个 versionName
             V=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1)
           fi
           V="${V:-1.0.0}"
@@ -64,13 +64,27 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "启动器版本 = $V"
 
+      # ⚠️ 2026-10 起 ubuntu-latest 镜像自带全局 Gradle 已升到 9.x，
+      #    而本项目 AGP 8.5.2 只支持 Gradle 8.x（AGP 用到的 InternalProblems
+      #    内部 API 在 Gradle 9.6 被移除）。原来的写法是直接用全局 gradle 跑
+      #    `gradle wrapper --gradle-version 8.7`，但这条命令会**先配置整个项目**
+      #    （解析 settings.gradle.kts → 加载 AGP），于是在配置阶段就炸了，
+      #    `--gradle-version 8.7` 根本来不及生效。
+      #    改为在临时空目录里生成 wrapper，完全不触碰本项目的构建脚本。
       - name: 生成 Gradle Wrapper（若缺失）
         run: |
           if [ ! -f ./gradlew ]; then
-            echo "==> gradlew 缺失，用全局 gradle 生成 wrapper"
-            gradle wrapper --gradle-version 8.7
+            echo "==> gradlew 缺失，在临时空目录生成 wrapper（避免用 Gradle 9 配置本项目）"
+            TMP=$(mktemp -d)
+            echo 'rootProject.name = "wrapper-gen"' > "$TMP/settings.gradle.kts"
+            ( cd "$TMP" && gradle wrapper --gradle-version 8.7 --distribution-type bin )
+            cp "$TMP/gradlew" "$TMP/gradlew.bat" .
+            mkdir -p gradle/wrapper
+            cp "$TMP/gradle/wrapper/gradle-wrapper.jar" gradle/wrapper/
+            rm -rf "$TMP"
           fi
           chmod +x ./gradlew
+          ./gradlew --version
 
       # ⭐ 固定签名：从 Secrets 还原 keystore，保证每次构建签名的证书一致，
       #    这样后续版本可以「覆盖升级」而不必卸载（不丢已导入的游戏包）。
@@ -82,8 +96,11 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           if [ -z "$KEYSTORE_B64" ]; then
-            echo "::warning::未配置 KEYSTORE_B64，将回退到 debug 签名（每次构建签名都会变！）"
-            exit 0
+            # ⚠️ 这里以前是打 warning 然后继续（exit 0），结果退回 runner 上临时的
+            #    debug 签名 —— 每个版本钥匙都不一样，用户每次更新都得卸载重装，
+            #    而卸载会清掉已导入的游戏包。宁可让构建失败，也不发出这种包。
+            echo "::error::未配置 KEYSTORE_B64，拒绝构建（否则签名每次都变，用户无法覆盖升级）"
+            exit 1
           fi
           echo "$KEYSTORE_B64" | base64 -d > app/stronghold.jks
           ls -lh app/stronghold.jks
@@ -95,35 +112,22 @@ jobs:
           KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          # 项目有两个构建变体：stable（正式）/ lab（联机实验）
-          # 同时产出两个 APK，包名不同可并存
-          ./gradlew :app:assembleStableRelease :app:assembleLabRelease --stacktrace --no-daemon
+          # 2.1.0 起合并了 stable / lab，只有一个变体
+          ./gradlew :app:assembleRelease --stacktrace --no-daemon
 
       - name: 收集 APK 并正式命名
         id: apk
         run: |
           V="${{ steps.ver.outputs.version }}"
           NAME="StrongholdShell-launcher-v${V}-android.apk"
-          LAB_NAME="StrongholdShell-launcher-v${V}-lab-android.apk"
           mkdir -p out
-          # stable 版（正式，不含联机入口）
-          cp app/build/outputs/apk/stable/release/*.apk "out/${NAME}"
-          # lab 版（联机实验，独立包名 com.stronghold.shell.lab）
-          if ls app/build/outputs/apk/lab/release/*.apk >/dev/null 2>&1; then
-            cp app/build/outputs/apk/lab/release/*.apk "out/${LAB_NAME}"
-          fi
+          cp app/build/outputs/apk/release/*.apk "out/${NAME}"
           ls -lh out/
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
-          echo "lab_name=$LAB_NAME" >> "$GITHUB_OUTPUT"
           # 记录 SHA-256，写进 Release 说明
           SHA=$(sha256sum "out/${NAME}" | cut -d' ' -f1)
           echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
           echo "$NAME SHA-256: $SHA"
-          if [ -f "out/${LAB_NAME}" ]; then
-            LAB_SHA=$(sha256sum "out/${LAB_NAME}" | cut -d' ' -f1)
-            echo "lab_sha256=$LAB_SHA" >> "$GITHUB_OUTPUT"
-            echo "$LAB_NAME SHA-256: $LAB_SHA"
-          fi
 
       - name: 对齐与签名校验
         run: |
@@ -136,6 +140,23 @@ jobs:
             "$AS" verify --verbose "$f" | head -6 || echo "::error::签名校验失败 $f"
           done
 
+      # ⭐ 证书指纹必须固定不变。一旦换了钥匙，老用户装新包会被系统要求先卸载，
+      #    而卸载会清空 filesDir 里的游戏包（800MB 要重新下载）。
+      #    指纹是证书的公开摘要，不是密钥，写进公开仓库没有风险。
+      - name: 校验签名证书指纹
+        run: |
+          AS="${ANDROID_HOME}/build-tools/34.0.0/apksigner"
+          EXPECT="6b825bc9f5ef05ab1ec545f9872d6fa0e6301b653760f3937896fbcd21a53c71"
+          for f in out/*.apk; do
+            GOT=$("$AS" verify --print-certs "$f" | grep -m1 "certificate SHA-256 digest" | awk '{print $NF}')
+            echo "$f -> $GOT"
+            if [ "$GOT" != "$EXPECT" ]; then
+              echo "::error::$f 的签名证书不对（期望 $EXPECT，实际 $GOT）—— 装到旧版本上会要求卸载重装"
+              exit 1
+            fi
+          done
+          echo "两个 APK 的签名证书都正确"
+
       - name: 上传 APK 产物（备份）
         uses: actions/upload-artifact@v4
         with:
@@ -143,22 +164,95 @@ jobs:
           path: out/*.apk
           if-no-files-found: error
 
+      # ⚠️ 发布说明里的「本版修复」需要每次发版手动更新：
+      #    版本号不是重点，用户要看的是「这次修了什么问题」。
+      #    写清「修了什么现象 → 为什么会这样 → 现在怎么表现」，别只写"优化体验"。
       - name: 发布到 Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: launcher-v${{ steps.ver.outputs.version }}
+          # ⚠️ 不写这一行，tag 会落在仓库默认分支（main）的最新提交上，
+          #    而不是这次实际构建的分支 —— 表现就是 Release 页的源码链接
+          #    指向 main 的老代码。github.sha 是本次检出到的那个提交。
+          target_commitish: ${{ github.sha }}
           name: 卫戍协议启动器 v${{ steps.ver.outputs.version }}
           body: |
             **《卫戍协议：盟约》安卓启动器** —— 不含游戏内容的空壳，导入上游完整包即可游玩。
 
-            ## 本次包含两个 APK
+            ## 本版更新（v2.1.0）
+
+            **联机版合并进正式版**
+
+            - 不再分「正式版 / Lab 实验版」，多人游戏入口直接进正式版，只发一个 APK。
+            - 以前装过 Lab 版（包名 `com.stronghold.shell.lab`）的请卸载它 ——
+              它的游戏包在独立包名下，新版本读不到，需要重新导入一次。
+
+            **签名固定，以后更新不用再卸载**
+
+            - 以前每次更新启动器都要先卸载旧版，一卸载游戏包就没了，得重新下载 800MB。
+              原因是不同构建用了不同的签名证书，系统判定「不是同一个应用」。
+            - 现在签名钥匙固定，CI 还会校验证书指纹 —— 以后所有版本都能直接覆盖升级，
+              已导入的游戏包不会再丢。
+
+            **导入游戏包有进度条了**
+
+            - 以前导入 800MB 的包只有一句「正在导入，请勿退出」，几分钟没有任何反馈。
+            - 现在显示百分比、已处理文件数和已解压体积。
+
+            **启动器可以在应用内更新**
+
+            - 主页「更新启动器」按钮，发现新版本会高亮显示版本号，点一下就能下载安装。
+            - 下载走和游戏包同一套镜像，卡住可以换源，代理全挂时回落到 GitHub 直连。
+            - 装之前校验签名，和当前应用不一致会拒绝安装。
+
+            ## 上一版（v2.0.4）
+
+            **盟约条两端的黑箭头、下方黑线**
+
+            - 游戏画面里盟约（角色栏）左右各多出一个灰黑方块箭头，条下面还有一条黑线，
+              而同一台手机用浏览器打开同一个服务器是干净的。
+            - 原因不在启动器，在游戏前端自己的 CSS：触摸设备上每个可点元素会被套一层
+              44px 的透明点击热区，盟约槽位实际只有 29.6px，热区多出来的部分溢出进了
+              横向滚动宽度里，游戏据此以为"右边还有内容"，于是把滚动箭头点亮；
+              那条黑线就是横向滚动条。
+            - 现在由启动器在页面启动时注入样式，隐藏这两个箭头和滚动条。
+              顺带把左侧展开按钮和盟约标签之间的空隙从 54px 收到 8px，角色栏能多放下好几个。
+
+            ## 上一版（v2.0.3）
+
+            **联机提示不再误报、不再刷屏**
+
+            - 之前玩一会儿就来回弹「未连接 / 已连接」，其实连接一直是好的。
+              原因是游戏前端自带自动重连，每次重连都会产生一次断开+连上的事件，
+              旧逻辑逐条弹提示；页面里同时开着多条 WebSocket 时，旧连接正常关闭
+              也会被当成联机断开。
+            - 现在按连接记账，只有全部连接都断了才算掉线；首次连上提示一次，
+              之后的重连全部静默；真的掉线超过 10 秒才提示一次「联机已断开」，
+              恢复后提示一次「已重新连上」。
+            - 提示停留时间由 3.5 秒缩短到 2 秒，不再挡视线。
+            - 移除了游戏画面上常驻的调试横幅，不再遮挡 HUD。
+
+            **服务器地址更好填**
+
+            - 域名不再强制补 `:3000`。挂在 Cloudflare / Nginx 后面的域名只开放
+              80/443，补 3000 会一直连不上。现在：域名默认 80，局域网 IP 默认 3000，
+              显式写的端口优先；端口就是协议默认值时不再显示出来。
+            - 支持 IPv6 地址，例如 `[2001:db8::1]:3000`。
+            - 支持 `https://` / `wss://` 加密连接，填了 443 端口也会自动走加密。
+
+            **首次启动黑屏**
+
+            - 修复 Node 服务端口还没就绪、WebView 抢跑导致的黑底错误页。
+              现在会退到「正在启动游戏…」并自动重试，正常 3 秒进标题页。
+
+            ## 本次包含 1 个 APK
 
             | 文件 | 包名 | 说明 |
             |---|---|---|
-            | `${{ steps.apk.outputs.name }}` | `com.stronghold.shell` | **正式版**。功能与之前一致，不含联机入口。 |
-            | `${{ steps.apk.outputs.lab_name }}` | `com.stronghold.shell.lab` | **实验版**。多一个「多人游戏」入口，可填服务器地址联机。 |
+            | `${{ steps.apk.outputs.name }}` | `com.stronghold.shell` | 正式版，含多人游戏入口 |
 
-            两个包名不同，**可以同时安装、互不覆盖**。实验版验证稳定后会合并进正式版。
+            > **从 v2.0.4 及更早版本升级，需要卸载重装一次**（签名换过了），
+            > 之后的所有版本都可以直接覆盖升级，不会再丢游戏包。
 
             ## 怎么用
 
@@ -168,9 +262,9 @@ jobs:
             3. 打开启动器 → 点「导入游戏包 (.zip)」→ 选中那个 zip
             4. 等待解压（首次几十秒）→ 点「启动游戏」
 
-            ## 联机怎么玩（仅实验版）
+            ## 联机怎么玩
 
-            1. 打开实验版 → 点「🌐 多人游戏（实验）」
+            1. 点「🌐 多人游戏（实验）」
             2. 点「＋ 添加服务器」，填一个地址（如 `192.168.1.10:3000`）
             3. 朋友填**同一个地址**，你们就连到了同一个服务器
             4. 进游戏后照常建房 / 加入房间
@@ -188,8 +282,6 @@ jobs:
 
             - `${{ steps.apk.outputs.name }}`
               SHA-256: `${{ steps.apk.outputs.sha256 }}`
-            - `${{ steps.apk.outputs.lab_name }}`
-              SHA-256: `${{ steps.apk.outputs.lab_sha256 }}`
 
             > 非官方同人作品，游戏素材版权归上海鹰角网络 / Yostar，仅供学习交流、严禁盈利。
           files: out/*.apk
