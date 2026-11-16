@@ -110,6 +110,13 @@ lastKnownLatest = j.optString("lastKnownLatest", ""),
         if (p.verifyMode != "off") m["SP_VERIFY"] = p.verifyMode
         if (p.pluginScripts != "off") m["SP_PLUGIN_SCRIPTS"] = p.pluginScripts
         m["SP_NO_BROWSER"] = "1"
+        // ⭐ 0.4.0+ 的官方版本 / 玩法插件会把对局放进 match-host。
+        //    上游默认 transport='process'，走 child_process.fork()；但本壳是 JNA 内嵌
+        //    libnode、进程内跑 node::Start，没有真实的 node 可执行文件——fork 出来的
+        //    "node 子进程"其实是 /system/bin/app_process64，一启动就 SIGABRT
+        //    ("Error changing dalvik-cache ownership : Permission denied")。
+        //    强制用 worker_threads（同一进程内的线程）即可绕开，不需要外部进程。
+        m["SP_MATCH_HOST"] = "worker"
         return m
     }
 
