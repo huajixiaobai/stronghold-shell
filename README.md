@@ -159,6 +159,29 @@ JNA 直接拿 `libnode.so` 导出的 **C++ 符号** `_ZN4node5StartEiPPc`
 10. **首启慢 ≠ 崩溃**：上游 Node 首启要加载两万多个文件、需几十秒。
     启动器已内置「正在启动游戏…」加载页（替代黑屏），轮询上限 90 秒。
 
+## 贡献者
+
+感谢以下朋友的代码贡献，本启动器的很多关键修复来自他们：
+
+### [@blwsh-1](https://github.com/blwsh-1)
+
+| 贡献 | 说明 |
+|---|---|
+| **增量包更新**（`PackUpdater` / `SteppedUpdater`） | 利用上游 `UPDATE.json` 的增量清单，一次更新从几百 MB 降到几十 MB。含跨版本逐级升级、`removed` 列表带 sha256 防误删用户改过的文件 |
+| **启动器自身增量更新**（`LauncherUpdater`） | 壳的更新同样走增量 |
+| **崩溃守护**（`CrashGuard`） | 异常兜底 |
+| **移除常驻联机横幅**（`WsHook`） | 解决 [Issue #1](../../issues/1) —— 横幅长期遮挡游戏 HUD |
+| **真实连接状态检测**（`openSockets` 按 sockId 记账） | 修复「假掉线」误报：同一页面可能同时开多条 WS，旧的那条正常关闭不代表联机断了 |
+| **首次黑屏修复**（`loadRetries` / `polling`） | 定位到根因：Node 线程先广播「已就绪」，但端口尚未监听，WebView 抢先请求拿到 `ERR_CONNECTION_REFUSED` |
+| **`SP_MATCH_HOST=worker`**（PR #4） | **关键修复**：上游 0.4.0 的 `match-host` 默认 `transport=process` 走 `child_process.fork()`，而本壳是 JNA 内嵌 libnode、进程内跑 `node::Start`，没有真实的 node 可执行文件——fork 出来的是 `/system/bin/app_process64`，一启动就 SIGABRT。强制改用 `worker_threads` 绕开 |
+| **CI 改进** | Gradle 9 wrapper 兼容修复、`KEYSTORE` 缺失从 `exit 0` 改为 `exit 1`（避免签名失败的构建静默通过）、证书指纹校验、Release 加 `target_commitish` |
+
+### [@cocochinoa](https://github.com/cocochinoa)
+
+- [Issue #1](../../issues/1)：反馈联机提示长期遮挡视野，促成了横幅的移除
+
+---
+
 ## 合规红线
 
 - 上游 README 声明素材版权归鹰角，禁止再分发。
