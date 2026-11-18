@@ -1,0 +1,113 @@
+# 上游（sganggs/Stronghold-Protocol）环境变量基线
+#
+# 用途：.github/workflows/upstream-watch.yml 每隔一段时间扫描上游 server/ 与 shared/
+#      下的 .js 中所有 process.env.* 引用，与这份清单比对；出现「清单外的新变量」
+#      就开一个 Issue 提醒我们。
+#
+# 为什么需要：本壳是 JNA 内嵌 libnode，没有独立的 node 可执行文件。上游某些机制
+#           （例如 v0.4.0 引入的 match-host，默认走 child_process.fork）在安卓壳上
+#           必然崩溃。这类问题不该等用户反馈才发现。
+#
+# 如何更新：确认新变量对本壳无影响后，把它加进 env 列表并注明用途。
+#          若新变量需要本壳适配，先解决适配，再加进清单。
+
+upstream_repo: sganggs/Stronghold-Protocol
+upstream_branch: master
+baseline_version: v0.4.0
+baseline_date: "2026-11-18"
+
+env:
+  - name: PORT
+    use: 监听端口
+    shell: mapped
+
+  - name: HOST
+    use: 监听地址（默认 ::，IPv6 关闭时上游自动回落 IPv4）
+    shell: mapped
+
+  - name: SP_MATCH_HOST
+    use: 房间 match 的运行方式。process=child_process.fork（上游默认） / worker=worker_threads
+    shell: forced-worker
+    note: |
+      本壳强制 worker。上游默认 process 走 child_process.fork()，但本壳进程内跑
+      node::Start，没有真实 node 可执行文件——fork 出来的是 /system/bin/app_process64，
+      一启动即 SIGABRT（Error changing dalvik-cache ownership : Permission denied）。
+      注意 worker 模式的代价：worker 线程 OOM 会 abort 整个服务进程（exit 134），
+      而上游正是因为这一点才把 worker 从默认值改掉。本壳属被迫接受。
+
+  - name: SP_PLUGIN_SCRIPTS
+    use: 插件脚本运行模式（off / sandbox）
+    shell: mapped
+
+  - name: SP_VERSIONS
+    use: 启用哪些官方版本（all 或逗号分隔的 id 列表）；默认 all
+    shell: unmapped
+    note: |
+      默认 'all' 会启用全部官方版本，大厅再把这些版本预选中——这正是 v0.4.0 一导入
+      就触发 match-host 的路径。本壳不收窄此项（收窄=功能阉割），改由用户自定义环境
+      变量自行处理。
+
+  - name: SP_VERSION_DEFAULT
+    use: 默认版本 id（未设置时大厅预选当季 LOBBY_DEFAULT_VERSION）
+    shell: unmapped
+
+  - name: SP_MAX_VERSION_HOSTS
+    use: 版本 match host 的数量上限
+    shell: unmapped
+
+  - name: SP_CSP
+    use: 设为 off 时关闭 CSP 头（上游内置的逃生开关）
+    shell: unmapped
+    note: 若 WebView 端因 CSP 出现资源加载失败，本壳可考虑默认 off。
+
+  - name: SP_ASSET_INDEX
+    use: 设为 off/0/false/no 时关闭资源哈希索引（可省内存与启动时间）
+    shell: unmapped
+
+  - name: SP_P2P_ICE_SERVERS
+    use: P2P 联机使用的 ICE 服务器列表
+    shell: unmapped
+
+  - name: TRUST_PROXY
+    use: 反向代理信任配置
+    shell: unmapped
+
+  - name: SP_SHUTDOWN_TIMEOUT_MS
+    use: 关闭时的超时时间
+    shell: unmapped
+
+  - name: SP_BOT_STRATEGY
+    use: 机器人策略 id（external 需额外配置）
+    shell: unmapped
+
+  - name: SP_BOT_STRATEGY_SEATS
+    use: 分座位指定机器人策略
+    shell: unmapped
+
+  - name: SP_BOT_EMOTES
+    use: 机器人表情
+    shell: unmapped
+
+  - name: SP_PLUGIN_RESOURCES
+    use: 插件资源（studio/gameData）
+    shell: unmapped
+
+  - name: SP_PLUGIN_TEST_SET
+    use: 插件脚本测试集
+    shell: unmapped
+
+  - name: SP_SCRIPT_PROBE_MS
+    use: 脚本预检探测间隔
+    shell: unmapped
+
+  - name: SP_TEST_MODE
+    use: 测试模式
+    shell: unmapped
+
+  - name: SP_LOOP_SAMPLE
+    use: 设为 1 时采样主线程事件循环延迟并打日志
+    shell: unmapped
+
+  - name: DEBUG
+    use: 调试输出
+    shell: unmapped
