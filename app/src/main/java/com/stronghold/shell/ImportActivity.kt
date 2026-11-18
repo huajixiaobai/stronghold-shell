@@ -782,6 +782,28 @@ class ImportActivity : AppCompatActivity() {
             switchNav(NAV_SETTINGS)
         } }, cardLp())
 
+        c.addView(UiKit.divider(this, "高级"))
+        // ===== 自定义环境变量：全版本兼容的逃生通道 =====
+        // 上游每次新增环境变量都可能带来一处安卓壳不兼容的地方（v0.4.0 的
+        // match-host 就是例子）。有了这个入口，用户不必等启动器发版就能自救
+        // —— 这是「导入新包就能玩」这件事真正的兜底。
+        val envCount = Settings.parseExtraEnv(cur.extraEnv).size
+        c.addView(settingRow(
+            "自定义环境变量",
+            if (envCount == 0) "未设置" else "已设 $envCount 项",
+            "每行一个 KEY=VALUE。游戏启动不起来时，可在这里临时覆盖上游行为"
+        ) {
+            editMultiline(
+                "自定义环境变量",
+                "# 每行一个，例如：\n# SP_VERSIONS=act2autochess\n# SP_CSP=off",
+                cur.extraEnv
+            ) { text ->
+                val p = Settings.load(this); p.extraEnv = text; Settings.save(this, p)
+                val n = Settings.parseExtraEnv(text).size
+                toast(if (n == 0) "已清空自定义环境变量" else "已保存 $n 项（重启游戏生效）")
+                switchNav(NAV_SETTINGS)
+            }
+        }, cardLp())
         c.addView(UiKit.divider(this, "下载"))
         c.addView(settingRow(
             "下载位置",
@@ -877,6 +899,41 @@ class ImportActivity : AppCompatActivity() {
                 if (v == null || v < min || v > max) toast("请输入 $min ~ $max 之间的数字")
                 else onOk(v)
             }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /**
+     * 多行文本编辑对话框（用于自定义环境变量）。
+     *
+     * 不用 InputType.TYPE_TEXT_FLAG_MULTI_LINE 之外的任何花活：不同机型对
+     * 多行 EditText 的默认行为差异很大，这里显式给一个能滚动的最小实现。
+     */
+    private fun editMultiline(
+        title: String,
+        hint: String,
+        cur: String,
+        onOk: (String) -> Unit
+    ) {
+        val et = EditText(this).apply {
+            setText(cur)
+            hint?.let { this.hint = it }
+            inputType = InputType.TYPE_CLASS_TEXT or
+                        InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                        InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            gravity = Gravity.TOP or Gravity.START
+            minLines = 6
+            maxLines = 14
+            setSingleLine(false)
+            setSelection(text.length)
+        }
+        val scroll = ScrollView(this).apply { addView(et) }
+        val pad = (16 * resources.displayMetrics.density).toInt()
+        scroll.setPadding(pad, pad / 2, pad, 0)
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(scroll)
+            .setPositiveButton("保存") { _, _ -> onOk(et.text.toString()) }
             .setNegativeButton("取消", null)
             .show()
     }
