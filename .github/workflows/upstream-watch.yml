@@ -1,0 +1,102 @@
+name: 上游环境变量监控
+
+# 本壳是 JNA 内嵌 libnode，没有独立 node 可执行文件。上游某些机制
+# （v0.4.0 的 match-host 默认走 child_process.fork）在安卓壳上必然崩溃，
+# 而这类问题不该等用户反馈才发现。此工作流定期扫描上游的 process.env
+# 引用，出现基线外的新变量就开 Issue 提醒。
+#
+# 基线：.github/upstream-env-baseline.yml
+# 确认新变量对本壳无影响后，手工加进基线即可。
+
+on:
+  schedule:
+    # 每天 UTC 02:00（北京 10:00）
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 扫描上游环境变量
+        id: scan
+        run: |
+          set +e
+          python3 scripts/check_upstream_env.py --json > scan.json
+          code=$?
+          echo "--- 扫描结果 ---"
+          cat scan.json
+          echo ""
+          echo "退出码: $code"
+          if [ "$code" = "10" ]; then
+            echo "has_new=true" >> "$GITHUB_OUTPUT"
+          elif [ "$code" = "0" ]; then
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            echo "::error::扫描脚本异常退出（码 $code）"
+            exit 1
+          fi
+
+      - name: 渲染 Issue 正文
+        if: steps.scan.outputs.has_new == 'true'
+        run: python3 scripts/render_issue.py scan.json issue.md
+
+      - name: 查是否已有同类 Issue
+        if: steps.scan.outputs.has_new == 'true'
+        id: dup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          count=$(gh issue list --label upstream-watch --state open --json number --jq 'length')
+          echo "open_count=$count" >> "$GITHUB_OUTPUT"
+          echo "现有 upstream-watch Issue: $count 个"
+
+      - name: 开 Issue
+        if: steps.scan.outputs.has_new == 'true' && steps.dup.outputs.open_count == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create upstream-watch \
+            --description '上游环境变量基线外的变化' \
+            --color FBCA04 2>/dev/null || true
+          gh issue create \
+            --title "上游新增环境变量，需要确认是否影响本壳" \
+            --body-file issue.md \
+            --label upstream-watch
+
+      - name: 已有同类 Issue 则追加评论
+        if: steps.scan.outputs.has_new == 'true' && steps.dup.outputs.open_count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          num=$(gh issue list --label upstream-watch --state open --json number --jq '.[0].number')
+          {
+            echo ""
+            echo "---"
+            echo "_再次扫描于 $(date -u '+%Y-%m-%d %H:%M UTC')，上面的变量仍未加进基线。_"
+            echo ""
+            cat issue.md
+          } > comment.md
+          gh issue comment "$num" --body-file comment.md
+
+      - name: 汇总
+        run: |
+          if [ "${{ steps.scan.outputs.has_new }}" = "true" ]; then
+            echo "::warning::上游出现了基线外的新环境变量"
+          else
+            echo "没有新变量，与基线一致"
+          fi
